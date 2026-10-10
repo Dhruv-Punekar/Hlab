@@ -1,0 +1,69 @@
+========================================================================
+TRANSFORMATION ENGINE - TECHNICAL SPECIFICATIONS
+========================================================================
+
+1. OVERVIEW
+The Transform Engine is the dedicated geometry math processor for the 3D 
+graphics pipeline. Its goal is to apply a 4x4 Transformation Matrix 
+(handling rotation, scaling, and translation) to a 3D vertex.
+- Status: Initial MVP Phase (Targets a single static frame)
+- Arithmetic: Q24.8 Signed Fixed-Point
+- Pipeline Depth: 3 Clock Cycles
+- Hardware Target: Xilinx Artix-7 (Nexys A7)
+
+2. MODULE INTERFACE (I/O)
+- clk       : System clock
+- rst_n     : Active-low asynchronous reset
+- ready_in  : Handshake input from the Projection Engine (0 = Stall)
+- valid_in  : Handshake input from Master FSM (1 = Data is good)
+- ready_out : Handshake output back to Master FSM 
+- valid_out : Handshake output telling Projection Engine data is ready
+
+3. DATA FORMATS
+3.1 Vertex Input Bus (vertex_in)
+- Size: 144 bits
+- Unpacking Structure:
+  [143:112] : X Coordinate (32-bit Q24.8)
+  [111:80]  : Y Coordinate (32-bit Q24.8)
+  [79:48]   : Z Coordinate (32-bit Q24.8)
+  [47:16]   : W Coordinate (32-bit Q24.8)
+  [15:0]    : Color (16-bit RGB565)
+
+3.2 Matrix Input Bus (matrix_in)
+- Size: 512 bits
+- Unpacking Structure:
+  [511:480] : M00 (Row 0, affects X')
+  [479:448] : M01
+  ...
+  [31:0]    : M33 (Row 3, affects W')
+
+4. HARDWARE ARCHITECTURE (3-STAGE DATAPATH)
+The module is architected as a fully synchronous 3-stage pipeline to 
+guarantee successful timing closure at high clock frequencies.
+
+- Stage 1 (Multiplication): The input coordinates and matrix elements 
+  are fed into 16 parallel multiplication equations. Vivado infers 16 
+  physical DSP48E1 slices. The output of this stage yields 16 
+  64-bit Q48.16 products stored in D-Flip Flops.
+
+- Stage 2 (Truncation & Add Stage 1): The 64-bit products are bit-sliced 
+  (truncation). Only bits [39:8] are retained to convert the numbers 
+  back to 32-bit Q24.8. These are then fed into 8 parallel LUT-based 
+  adders to calculate the partial sums (A+B) and (C+D).
+
+- Stage 3 (Add Stage 2): The final 4 parallel additions are executed 
+  to yield X', Y', Z', and W'. 
+
+5. COLOR SYNCHRONIZATION
+The RGB565 color data is entirely unaffected by the matrix math. However, 
+to ensure it exits the module attached to the correct geometry, it is 
+passed through a 3-cycle Shift Register, keeping it perfectly synchronized 
+with the 3-cycle math pipeline.
+
+6. STALLING LOGIC
+The pipeline handles back-pressure via the `ready_in` signal. This signal 
+is tied directly to the Clock Enable (CE) functionality of the internal 
+registers. If the downstream Projection Engine drops `ready_in` to 0, 
+the entire Transform Engine pipeline instantly freezes, preserving all 
+in-flight vertices without losing data.
+========================================================================
