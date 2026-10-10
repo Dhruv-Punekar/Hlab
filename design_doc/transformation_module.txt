@@ -54,6 +54,22 @@ guarantee successful timing closure at high clock frequencies.
 - Stage 3 (Add Stage 2): The final 4 parallel additions are executed 
   to yield X', Y', Z', and W'. 
 
+4.1 OVERFLOW DETECTION & SATURATION (Hardware Safety Net)
+Because fixed-point arithmetic is restricted to a physical number of bits, 
+extreme scaling or translation can cause mathematical overflow (where a 
+massive positive number wraps around and becomes a massive negative number, 
+causing catastrophic visual glitches on screen). 
+
+To prevent this, two combinational safety functions are integrated into 
+Stages 2 and 3:
+- `sat_trunc`: When shrinking the 64-bit DSP product back to 32 bits, the 
+  function checks the discarded upper bits [62:39]. If critical data is 
+  detected, it saturates (clamps) the output to the maximum possible 32-bit 
+  value (32'h7FFF_FFFF for positive, 32'h8000_0000 for negative).
+- `sat_add`: When adding two 32-bit numbers, the function checks the sign 
+  bits. If adding two positives yields a negative, or two negatives yields 
+  a positive, it instantly clamps the sum to the maximum safety bounds.
+
 5. COLOR SYNCHRONIZATION
 The RGB565 color data is entirely unaffected by the matrix math. However, 
 to ensure it exits the module attached to the correct geometry, it is 

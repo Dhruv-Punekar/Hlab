@@ -4,6 +4,7 @@
 // Module: transform_engine
 // Purpose: Applies a 4x4 Transformation Matrix to a 3D vertex using a 
 //          fully pipelined 3-stage DSP datapath. Uses Q24.8 Fixed-Point math.
+// Features: Handshaking (CE Stalls), Color Passthrough, Saturation logic.
 // ============================================================================
 module transform_engine (
     input  wire         clk,
@@ -22,31 +23,65 @@ module transform_engine (
 );
 
     // ========================================================================
+    // COMBINATIONAL FUNCTIONS (Saturation Safety Nets)
+    // ========================================================================
+    // 1. Saturation Truncation (64-bit to 32-bit Q24.8)
+    // Prevents extreme scaling overflow from wrapping around the screen.
+    function signed [31:0] sat_trunc;
+        input signed [63:0] prod;
+        begin
+            if (prod[63] == 1'b0 && (|prod[62:39] == 1'b1)) 
+                sat_trunc = 32'h7FFF_FFFF; // Clamp to Max Positive
+            else if (prod[63] == 1'b1 && (~&prod[62:39] == 1'b1)) 
+                sat_trunc = 32'h8000_0000; // Clamp to Max Negative
+            else
+                sat_trunc = prod[39:8];    // Normal Truncation
+        end
+    endfunction
+
+    // 2. Saturation Addition (32-bit + 32-bit)
+    // Prevents adding two massive numbers from flipping the sign bit.
+    function signed [31:0] sat_add;
+        input signed [31:0] a;
+        input signed [31:0] b;
+        reg signed [31:0] sum;
+        begin
+            sum = a + b;
+            if (a[31] == 1'b0 && b[31] == 1'b0 && sum[31] == 1'b1)
+                sat_add = 32'h7FFF_FFFF; // Positive Overflow
+            else if (a[31] == 1'b1 && b[31] == 1'b1 && sum[31] == 1'b0)
+                sat_add = 32'h8000_0000; // Negative Overflow
+            else
+                sat_add = sum;           // Normal Addition
+        end
+    endfunction
+
+    // ========================================================================
     // 1. DATA UNPACKING (Combinational)
     // ========================================================================
-    // Extract Vertex Coordinates (Cast as signed for two's complement math)
+    // Extract Vertex Coordinates
     wire signed [31:0] in_X = $signed(vertex_in[143:112]);
     wire signed [31:0] in_Y = $signed(vertex_in[111:80]);
     wire signed [31:0] in_Z = $signed(vertex_in[79:48]);
     wire signed [31:0] in_W = $signed(vertex_in[47:16]);
     wire        [15:0] in_C = vertex_in[15:0];
 
-    // Extract Matrix Elements (Row 0: Affects X')
+    // Extract Matrix Elements (Rows 0 to 3)
     wire signed [31:0] M00 = $signed(matrix_in[511:480]);
     wire signed [31:0] M01 = $signed(matrix_in[479:448]);
     wire signed [31:0] M02 = $signed(matrix_in[447:416]);
     wire signed [31:0] M03 = $signed(matrix_in[415:384]);
-    // Extract Matrix Elements (Row 1: Affects Y')
+    
     wire signed [31:0] M10 = $signed(matrix_in[383:352]);
     wire signed [31:0] M11 = $signed(matrix_in[351:320]);
     wire signed [31:0] M12 = $signed(matrix_in[319:288]);
     wire signed [31:0] M13 = $signed(matrix_in[287:256]);
-    // Extract Matrix Elements (Row 2: Affects Z')
+    
     wire signed [31:0] M20 = $signed(matrix_in[255:224]);
     wire signed [31:0] M21 = $signed(matrix_in[223:192]);
     wire signed [31:0] M22 = $signed(matrix_in[191:160]);
     wire signed [31:0] M23 = $signed(matrix_in[159:128]);
-    // Extract Matrix Elements (Row 3: Affects W')
+    
     wire signed [31:0] M30 = $signed(matrix_in[127:96]);
     wire signed [31:0] M31 = $signed(matrix_in[95:64]);
     wire signed [31:0] M32 = $signed(matrix_in[63:32]);
@@ -55,9 +90,7 @@ module transform_engine (
     // ========================================================================
     // PIPELINE REGISTERS
     // ========================================================================
-    // Handshaking delays
     reg val_stg1, val_stg2, val_stg3;
-    // Color delay shift register
     reg [15:0] color_stg1, color_stg2, color_stg3;
 
     // Stage 1: 64-bit Multiplication Results
@@ -78,21 +111,18 @@ module transform_engine (
     // ========================================================================
     // CLOCKED PIPELINE LOGIC
     // ========================================================================
-    // We only accept new data if the next module (Projection) is ready to 
-    // receive data. This acts as our Clock Enable stall.
-    assign ready_out = ready_in;
+    assign ready_out = ready_in; // Back-pressure propagation
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             val_stg1 <= 0; val_stg2 <= 0; val_stg3 <= 0;
         end else if (ready_in) begin
             
-            // Push Valid Flags through pipeline
+            // Push Valid Flags & Color through pipeline
             val_stg1 <= valid_in;
             val_stg2 <= val_stg1;
             val_stg3 <= val_stg2;
 
-            // Push Color through 3-cycle delay
             color_stg1 <= in_C;
             color_stg2 <= color_stg1;
             color_stg3 <= color_stg2;
@@ -106,21 +136,27 @@ module transform_engine (
             pW0 <= in_X * M30;  pW1 <= in_Y * M31;  pW2 <= in_Z * M32;  pW3 <= in_W * M33;
 
             // ----------------------------------------------------------------
-            // STAGE 2: TRUNCATION & ADDER TREE STAGE 1
-            // (Extracts [39:8] to restore Q24.8, then adds pairs)
+            // STAGE 2: SATURATION TRUNCATION & ADDER TREE STAGE 1
             // ----------------------------------------------------------------
-            sX_AB <= pX0[39:8] + pX1[39:8];   sX_CD <= pX2[39:8] + pX3[39:8];
-            sY_AB <= pY0[39:8] + pY1[39:8];   sY_CD <= pY2[39:8] + pY3[39:8];
-            sZ_AB <= pZ0[39:8] + pZ1[39:8];   sZ_CD <= pZ2[39:8] + pZ3[39:8];
-            sW_AB <= pW0[39:8] + pW1[39:8];   sW_CD <= pW2[39:8] + pW3[39:8];
+            sX_AB <= sat_add(sat_trunc(pX0), sat_trunc(pX1));
+            sX_CD <= sat_add(sat_trunc(pX2), sat_trunc(pX3));
+            
+            sY_AB <= sat_add(sat_trunc(pY0), sat_trunc(pY1));
+            sY_CD <= sat_add(sat_trunc(pY2), sat_trunc(pY3));
+            
+            sZ_AB <= sat_add(sat_trunc(pZ0), sat_trunc(pZ1));
+            sZ_CD <= sat_add(sat_trunc(pZ2), sat_trunc(pZ3));
+            
+            sW_AB <= sat_add(sat_trunc(pW0), sat_trunc(pW1));
+            sW_CD <= sat_add(sat_trunc(pW2), sat_trunc(pW3));
 
             // ----------------------------------------------------------------
-            // STAGE 3: ADDER TREE STAGE 2 (Final Transform)
+            // STAGE 3: SATURATION ADDER TREE STAGE 2 (Final Transform)
             // ----------------------------------------------------------------
-            out_X <= sX_AB + sX_CD;
-            out_Y <= sY_AB + sY_CD;
-            out_Z <= sZ_AB + sZ_CD;
-            out_W <= sW_AB + sW_CD;
+            out_X <= sat_add(sX_AB, sX_CD);
+            out_Y <= sat_add(sY_AB, sY_CD);
+            out_Z <= sat_add(sZ_AB, sZ_CD);
+            out_W <= sat_add(sW_AB, sW_CD);
 
         end
     end
@@ -128,7 +164,6 @@ module transform_engine (
     // ========================================================================
     // OUTPUT ASSIGNMENT
     // ========================================================================
-    // Pack the final rotated coordinates and synced color back into 144 bits
     assign vertex_out = {out_X, out_Y, out_Z, out_W, color_stg3};
     assign valid_out  = val_stg3;
 
