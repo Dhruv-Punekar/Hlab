@@ -1,0 +1,83 @@
+RASTERIZER INPUTS
+
+A. Triangle data — from Triangle Setup
+Signal					Width					Purpose
+bbox_min_x				10 bits				Minimum X coordinate of bounding box
+bbox_max_x				10 bits				Maximum X coordinate of bounding box
+bbox_min_y				10 bits				Minimum Y coordinate of bounding box
+bbox_max_y				10 bits				Maximum Y coordinate of bounding box
+
+edge0_A, edge0_B, edge0_C	32 bits each, signed			Edge 0 equation coefficients
+edge1_A, edge1_B, edge1_C	32 bits each, signed			Edge 1 equation coefficients
+edge2_A, edge2_B, edge2_C	32 bits each, signed			Edge 2 equation coefficients
+z_A, z_B, z_C			32 bits each, signed			Depth plane coefficients
+color_in			16 bits					Constant RGB565 color for the triangle
+
+E_i (x, y) = A_i * x + B_i * y + C_i
+z (x, y) = z_A * x + z_B * y + z_C
+
+B. Control signals
+Signal			Direction		Purpose
+clk			Input		System clock
+rst			Input		Reset rasterizer asynchronous active low.
+triangle_valid		Input		Triangle Setup indicates that triangle data is valid
+busy_fbuffer		Input		Z-buffer/framebuffer controller cannot accept pixels, e.g. during clearing 
+
+
+RASTERIZER OUTPUTS
+
+A. DATA OUTPUTS
+Signal					Width					Purpose
+pixel_x					10 bits				Pixel X coordinate
+pixel_y					10 bits				Pixel Y coordinate
+pixel_z					16 bits				Pixel depth
+pixel_color				16 bits				RGB565 pixel color
+	
+B. Control signals
+Signal				Purpose
+pixel_valid			Pixel data is valid for the Z-buffer
+idle_raster			Rasterizer is idle
+done_raster			Rasterization of the triangle has completed
+
+
+Notes:
+1. Input behaviour : 
+During C0: triangle_valid = 1, idle_raster = 1, and Triangle Setup drives the triangle data onto the input wires.
+At the rising edge into C1: The rasterizer captures the input values into internal registers.
+During C1: idle_raster = 0, so Triangle Setup can stop presenting the triangle and prepare to wait for the next available handshake.
+
+2. busy_fbuffer : don't process and output pixels when asserted, to frame buffer and the output holds it's value.
+
+3. the color for the triangle is fixed and passed on simply with the pixel.
+
+4. pixel_valid gets high at C0, the pixels values are also broadcasted at this cycle to frame buffer. Then frame buffer will detect it on rising edge of C1, subsequently frame buffer gets value from C0.
+
+5. Triangle setup will give output to rasterizer only if idle_raster = 1.
+
+6. inside triangle means E_i >= 0 for all three edges, with no top-left rule unless you want one to avoid double-drawing shared edges
+
+7. pixel centric calculation
+
+8. done_raster one-cycle pulse after the last pixel is accepted, with idle_raster returning to 1 the next cycle.
+
+9. if pixel_valid is high and busy_fbuffer is high at the same edge, the pixel isn’t consumed. I’d assume the rasterizer holds the same pixel and pixel_valid stays high until a cycle where busy is low.
+
+10. bbox is clamped to pixel dimension (300 x 400).
+
+11. 32 bit number is in Q24.8 and 16 bit is in Q12.4
+
+12. The rasterizer uses incremental evaluation of edge and depth functions, with values doubled to represent pixel-center sampling \((x+0.5,y+0.5)\) without fractional arithmetic. Moving right updates the accumulator by \(2A\), while moving down updates it by \(2B\), avoiding repeated multiplications for every pixel.
+
+
+1. FSM
+State			Purpose										Exit
+IDLE	idle_raster = 1. Latch the triangle when triangle_valid is high.	On the capture edge go to INIT_A, set idle_raster <= 0.
+INIT_A	Compute the offset term and the two products (a·xmin, b·ymin).		Next cycle, to INIT_B.
+INIT_B	Sum them into the starting value at the first pixel center.		Next cycle, to SCAN.
+SCAN	Test one pixel per enabled cycle and load the output registers. 	At the last pixel, go to DRAIN.
+Advance x, y and the accumulators.	
+DRAIN	The last pixel sits on the outputs until the framebuffer takes it.	When en is high, clear pixel_valid, set done_raster <= 1, go to FINISH.
+FINISH	done_raster is high for one cycle.					Set done_raster <= 0, idle_raster <= 1, go to IDLE.
+
+en = !busy_fbuffer. In SCAN and DRAIN, en = 0 freezes every register, so the outputs hold. INIT ignores busy because it emits no pixels. Reset (rst_n low, asynchronous) puts the FSM in IDLE with idle_raster = 1, done_raster = 0 and pixel_valid = 0.
+
