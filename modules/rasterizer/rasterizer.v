@@ -4,7 +4,11 @@
 // Edge-function triangle rasterizer, 1 pixel evaluated per cycle.
 //
 //  * Samples at pixel centers: (x+0.5, y+0.5)
-//  * Coefficients are Q24.8 (COEF_W = 32, FRAC_IN = 8)
+//  * Coefficients A, B (edges) and z_A, z_B, z_C are Q24.8 (COEF_W = 32, FRAC_IN = 8)
+//  * Edge constants edge0..2_C arrive as Q18.16 (EDGE_C_W = 34, EDGE_C_FRAC = 16) and are
+//    converted to Q24.8 at capture: arithmetic >>> 8, rounded half away from zero
+//    (C_ROUND = 1, keeps C(-edge) == -C(edge) so shared edges stay consistent) or
+//    truncated toward -infinity (C_ROUND = 0)
 //  * pixel_z output is signed Q12.4 (Z_OUT_W = 16, FRAC_OUT = 4), saturating
 //  * Inside test: E0 >= 0 && E1 >= 0 && E2 >= 0 (ties count as inside)
 //  * rst_n is asynchronous, active-low
@@ -24,7 +28,10 @@ module rasterizer #(
     parameter Z_OUT_W  = 16,   // pixel_z width
     parameter FRAC_OUT = 4,    // fractional bits of pixel_z (Q12.4)
     parameter COLOR_W  = 16,   // RGB565
-    parameter Z_SIGNED = 1     // 1: pixel_z signed [-2^(W-1),2^(W-1)-1], 0: unsigned
+    parameter Z_SIGNED = 1,    // 1: pixel_z signed [-2^(W-1),2^(W-1)-1], 0: unsigned
+    parameter EDGE_C_W    = 34, // edge constant input width (signed)
+    parameter EDGE_C_FRAC = 16, // fractional bits of the edge constant input (Q18.16)
+    parameter C_ROUND     = 1   // 1: round half away from zero, 0: floor
 )(
     input  wire                      clk,
     input  wire                      rst_n,           // async, active low
@@ -35,9 +42,12 @@ module rasterizer #(
     input  wire [COORD_W-1:0]        bbox_max_x,
     input  wire [COORD_W-1:0]        bbox_min_y,
     input  wire [COORD_W-1:0]        bbox_max_y,
-    input  wire signed [COEF_W-1:0]  edge0_A, edge0_B, edge0_C,
-    input  wire signed [COEF_W-1:0]  edge1_A, edge1_B, edge1_C,
-    input  wire signed [COEF_W-1:0]  edge2_A, edge2_B, edge2_C,
+    input  wire signed [COEF_W-1:0]  edge0_A, edge0_B,
+    input  wire signed [EDGE_C_W-1:0] edge0_C,
+    input  wire signed [COEF_W-1:0]  edge1_A, edge1_B,
+    input  wire signed [EDGE_C_W-1:0] edge1_C,
+    input  wire signed [COEF_W-1:0]  edge2_A, edge2_B,
+    input  wire signed [EDGE_C_W-1:0] edge2_C,
     input  wire signed [COEF_W-1:0]  z_A, z_B, z_C,
     input  wire [COLOR_W-1:0]        color_in,
 
@@ -53,7 +63,12 @@ module rasterizer #(
 
     // ---- status ----
     output reg                       idle_raster,
-    output reg                       done_raster
+    output reg                       done_raster,
+
+    // ---- debug taps (added for top-level logging; no effect on behaviour) ----
+    output wire [2:0]                dbg_state,
+    output wire [COORD_W-1:0]        dbg_x_cur,
+    output wire [COORD_W-1:0]        dbg_y_cur
 );
 
     // ------------------------------------------------------------------
@@ -61,6 +76,24 @@ module rasterizer #(
     // ------------------------------------------------------------------
     localparam PROD_W  = COEF_W + COORD_W + 1;        // exact signed product width
     localparam Z_SHIFT = FRAC_IN + 1 - FRAC_OUT;      // doubled scale -> Q12.4  (= 5)
+    localparam C_SHIFT = (EDGE_C_FRAC > FRAC_IN) ? (EDGE_C_FRAC - FRAC_IN) : 0;  // Q18.16 -> Q24.8 (= 8)
+
+    // Edge constant: Q18.16 -> Q24.8.
+    // One extra bit so adding the rounding offset cannot overflow; the integer part
+    // (EDGE_C_W - EDGE_C_FRAC bits) always fits in COEF_W - FRAC_IN bits.
+    function signed [COEF_W-1:0] conv_c;
+        input signed [EDGE_C_W-1:0] c;
+        reg signed [EDGE_C_W:0] e;
+        begin
+            e = {c[EDGE_C_W-1], c};
+            if (C_SHIFT > 0) begin
+                if (C_ROUND != 0)
+                    e = e + (e[EDGE_C_W] ? ((1 << (C_SHIFT-1)) - 1) : (1 << (C_SHIFT-1)));
+                e = e >>> C_SHIFT;
+            end
+            conv_c = e[COEF_W-1:0];
+        end
+    endfunction
 
     // FSM encoding
     localparam [2:0] S_IDLE   = 3'd0,
@@ -79,9 +112,9 @@ module rasterizer #(
     wire signed [COEF_W-1:0] in_b [0:3];
     wire signed [COEF_W-1:0] in_c [0:3];
 
-    assign in_a[0] = edge0_A;  assign in_b[0] = edge0_B;  assign in_c[0] = edge0_C;
-    assign in_a[1] = edge1_A;  assign in_b[1] = edge1_B;  assign in_c[1] = edge1_C;
-    assign in_a[2] = edge2_A;  assign in_b[2] = edge2_B;  assign in_c[2] = edge2_C;
+    assign in_a[0] = edge0_A;  assign in_b[0] = edge0_B;  assign in_c[0] = conv_c(edge0_C);
+    assign in_a[1] = edge1_A;  assign in_b[1] = edge1_B;  assign in_c[1] = conv_c(edge1_C);
+    assign in_a[2] = edge2_A;  assign in_b[2] = edge2_B;  assign in_c[2] = conv_c(edge2_C);
     assign in_a[3] = z_A;      assign in_b[3] = z_B;      assign in_c[3] = z_C;
 
     // ------------------------------------------------------------------
@@ -103,6 +136,10 @@ module rasterizer #(
     reg signed [PROD_W-1:0]  my  [0:3];   // INIT temp: b * ymin
 
     integer i;
+
+    assign dbg_state = state;
+    assign dbg_x_cur = x_cur;
+    assign dbg_y_cur = y_cur;
 
     // ------------------------------------------------------------------
     // Combinational helpers
@@ -185,7 +222,7 @@ module rasterizer #(
     // ------------------------------------------------------------------
     always @(posedge clk) begin
         case (state)
-            // capture inputs on the handshake edge in internal registers.
+            // capture inputs on the handshake edge
             S_IDLE: begin
                 if (triangle_valid) begin
                     xmin_q  <= bbox_min_x;
