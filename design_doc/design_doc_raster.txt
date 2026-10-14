@@ -7,19 +7,23 @@ bbox_max_x				10 bits				Maximum X coordinate of bounding box
 bbox_min_y				10 bits				Minimum Y coordinate of bounding box
 bbox_max_y				10 bits				Maximum Y coordinate of bounding box
 
-edge0_A, edge0_B, edge0_C	32 bits each, signed			Edge 0 equation coefficients
-edge1_A, edge1_B, edge1_C	32 bits each, signed			Edge 1 equation coefficients
-edge2_A, edge2_B, edge2_C	32 bits each, signed			Edge 2 equation coefficients
-z_A, z_B, z_C			32 bits each, signed			Depth plane coefficients
+edge0_A, edge0_B		32 bits each, signed, Q24.8		Edge 0 equation coefficients
+edge0_C				34 bits, signed, Q18.16			Edge 0 equation constant
+edge1_A, edge1_B		32 bits each, signed, Q24.8		Edge 1 equation coefficients
+edge1_C				34 bits, signed, Q18.16			Edge 1 equation constant
+edge2_A, edge2_B		32 bits each, signed, Q24.8		Edge 2 equation coefficients
+edge2_C				34 bits, signed, Q18.16			Edge 2 equation constant
+z_A, z_B, z_C			32 bits each, signed, Q24.8		Depth plane coefficients
 color_in			16 bits					Constant RGB565 color for the triangle
 
 E_i (x, y) = A_i * x + B_i * y + C_i
 z (x, y) = z_A * x + z_B * y + z_C
+(x, y are integer pixel coordinates; every function is evaluated at the pixel center (x+0.5, y+0.5))
 
 B. Control signals
 Signal			Direction		Purpose
 clk			Input		System clock
-rst			Input		Reset rasterizer asynchronous active low.
+rst_n			Input		Reset rasterizer asynchronous active low.
 triangle_valid		Input		Triangle Setup indicates that triangle data is valid
 busy_fbuffer		Input		Z-buffer/framebuffer controller cannot accept pixels, e.g. during clearing 
 
@@ -30,14 +34,21 @@ A. DATA OUTPUTS
 Signal					Width					Purpose
 pixel_x					10 bits				Pixel X coordinate
 pixel_y					10 bits				Pixel Y coordinate
-pixel_z					16 bits				Pixel depth
+pixel_z					16 bits, signed, Q12.4		Pixel depth (saturating)
 pixel_color				16 bits				RGB565 pixel color
 	
 B. Control signals
-Signal				Purpose
+Signal					Purpose
 pixel_valid			Pixel data is valid for the Z-buffer
 idle_raster			Rasterizer is idle
 done_raster			Rasterization of the triangle has completed
+
+C. Debug outputs (observation only, not part of the Z-buffer interface)
+Signal					Width					Purpose
+dbg_state				3 bits				FSM state: IDLE 0, INIT_A 1, INIT_B 2, SCAN 3, DRAIN 4, FINISH 5
+dbg_x_cur				10 bits				X coordinate of the pixel currently being evaluated
+dbg_y_cur				10 bits				Y coordinate of the pixel currently being evaluated
+These are plain wires onto internal registers; they do not change behaviour. They exist so the top level can log them (hierarchical references are not synthesizable).
 
 
 Notes:
@@ -45,8 +56,10 @@ Notes:
 During C0: triangle_valid = 1, idle_raster = 1, and Triangle Setup drives the triangle data onto the input wires.
 At the rising edge into C1: The rasterizer captures the input values into internal registers.
 During C1: idle_raster = 0, so Triangle Setup can stop presenting the triangle and prepare to wait for the next available handshake.
+After the capture edge the input wires may change freely (verified by scrambling them in simulation). triangle_valid is ignored in every state except IDLE.
 
 2. busy_fbuffer : don't process and output pixels when asserted, to frame buffer and the output holds it's value.
+Exact meaning: a pixel that is on the outputs is consumed by the framebuffer at the next rising edge where busy_fbuffer = 0. Output registers only change on edges where busy_fbuffer = 0 (in SCAN and DRAIN).
 
 3. the color for the triangle is fixed and passed on simply with the pixel.
 
@@ -55,29 +68,66 @@ During C1: idle_raster = 0, so Triangle Setup can stop presenting the triangle a
 5. Triangle setup will give output to rasterizer only if idle_raster = 1.
 
 6. inside triangle means E_i >= 0 for all three edges, with no top-left rule unless you want one to avoid double-drawing shared edges
+Final choice: no top-left rule. A pixel center that lies exactly on an edge counts as inside, so a pixel exactly on a shared edge is drawn by both triangles. Implemented as: the sign bit of all three edge accumulators is 0.
 
 7. pixel centric calculation
 
 8. done_raster one-cycle pulse after the last pixel is accepted, with idle_raster returning to 1 the next cycle.
+Timing: done_raster is high for exactly one cycle (the FINISH state); idle_raster returns to 1 on the edge where done_raster falls. From the capture edge, done_raster is high N+4 cycles later for a bounding box of N pixels with no stalls (measured: 120,004 cycles for 300 x 400 = 120,000 pixels).
 
 9. if pixel_valid is high and busy_fbuffer is high at the same edge, the pixel isn’t consumed. I’d assume the rasterizer holds the same pixel and pixel_valid stays high until a cycle where busy is low.
+Confirmed by simulation with random and burst stalls: the pixel is held, none is dropped, repeated or reordered.
 
-10. bbox is clamped to pixel dimension (300 x 400).
+10. bbox is clamped to pixel dimension (300 x 400). Behaviour for bbox_min > bbox_max is undefined (the scan counters wrap around).
+300 x 400 means 300 pixels wide (x = 0..299) by 400 pixels tall (y = 0..399) = 120,000 pixels.
 
 11. 32 bit number is in Q24.8 and 16 bit is in Q12.4
+Precisely: edge A, B and z_A, z_B, z_C are signed Q24.8 (32 bits). The edge constants edge0..2_C are signed Q18.16 (34 bits). pixel_z is signed Q12.4 (16 bits). pixel_color is RGB565.
 
-12. The rasterizer uses incremental evaluation of edge and depth functions, with values doubled to represent pixel-center sampling \((x+0.5,y+0.5)\) without fractional arithmetic. Moving right updates the accumulator by \(2A\), while moving down updates it by \(2B\), avoiding repeated multiplications for every pixel.
+12. The rasterizer uses incremental evaluation of edge and depth functions, with values doubled to represent pixel-center sampling (x+0.5, y+0.5) without fractional arithmetic. Moving right updates the accumulator by (2A), while moving down updates it by (2B), avoiding repeated multiplications for every pixel.
+Accumulators are 48 bits signed. Start value at the center of (xmin, ymin) = 2c + a + b + 2*a*xmin + 2*b*ymin, where c is the Q24.8 constant; one accumulator per plane (edge 0, 1, 2 and depth). Moving to the next row adds 2B to the row-start value and reloads x at xmin.
 
+13. Pixel stream: during SCAN, every enabled cycle loads pixel_x, pixel_y, pixel_z and pixel_color for the next bounding-box position, in row-major order (x fastest). pixel_valid = 1 only if the pixel is inside the triangle; the framebuffer ignores pixels with pixel_valid = 0. pixel_x and pixel_y therefore walk the whole bounding box even when pixel_valid = 0.
+
+14. Depth output: the 2x accumulator is shifted right by 5 (arithmetic, floor) to Q12.4, then saturated to the signed 16-bit range (raw -32768..32767, i.e. -2048.0 .. +2047.9375). It never wraps.
+
+15. Edge constant: edge C arrives as Q18.16 and is converted to Q24.8 at the capture edge by an arithmetic shift of 8 with rounding half away from zero (parameter C_ROUND = 1), so C(-edge) == -C(edge) and shared edges stay consistent. Limit: |C| must be below 2^17 = 131072 in real units (34-bit input). For a 300 x 400 screen with vertices at screen coordinates the largest value is about 400 * 300 = 120,000, which fits; larger screens or vertices far from the origin need Triangle Setup to scale or translate the coefficients (only the sign of E matters, so all of A, B, C of an edge may be scaled by the same positive factor).
 
 1. FSM
-State			Purpose										Exit
-IDLE	idle_raster = 1. Latch the triangle when triangle_valid is high.	On the capture edge go to INIT_A, set idle_raster <= 0.
-INIT_A	Compute the offset term and the two products (a·xmin, b·ymin).		Next cycle, to INIT_B.
-INIT_B	Sum them into the starting value at the first pixel center.		Next cycle, to SCAN.
-SCAN	Test one pixel per enabled cycle and load the output registers. 	At the last pixel, go to DRAIN.
-Advance x, y and the accumulators.	
-DRAIN	The last pixel sits on the outputs until the framebuffer takes it.	When en is high, clear pixel_valid, set done_raster <= 1, go to FINISH.
-FINISH	done_raster is high for one cycle.					Set done_raster <= 0, idle_raster <= 1, go to IDLE.
+State				Purpose										
+IDLE		idle_raster = 1. Latch the triangle when triangle_valid is high.	On the capture edge go to INIT_A, set idle_raster <= 0.
+INIT_A		Compute the offset term and the two products (a·xmin, b·ymin).		Next cycle, to INIT_B.
+INIT_B		Sum them into the starting value at the first pixel center.		Next cycle, to SCAN.
+SCAN		Test one pixel per enabled cycle and load the output registers. 	At the last pixel, go to DRAIN.
+		Advance x, y and the accumulators.	
+DRAIN		The last pixel sits on the outputs until the framebuffer takes it.	When en is high, clear pixel_valid, set done_raster <= 1, go to FINISH.
+FINISH		done_raster is high for one cycle.					Set done_raster <= 0, idle_raster <= 1, go to IDLE.
 
-en = !busy_fbuffer. In SCAN and DRAIN, en = 0 freezes every register, so the outputs hold. INIT ignores busy because it emits no pixels. Reset (rst_n low, asynchronous) puts the FSM in IDLE with idle_raster = 1, done_raster = 0 and pixel_valid = 0.
+en = !busy_fbuffer. In SCAN and DRAIN, en = 0 freezes every register, so the outputs hold. INIT ignores busy because it emits no pixels. Reset (rst_n low, asynchronous) puts the FSM in IDLE with idle_raster = 1, done_raster = 0 and pixel_valid = 0 (pixel_x, pixel_y, pixel_z and pixel_color are also cleared to 0).
+State encoding (dbg_state): IDLE = 0, INIT_A = 1, INIT_B = 2, SCAN = 3, DRAIN = 4, FINISH = 5. The first enabled SCAN cycle loads the pixel at (bbox_min_x, bbox_min_y); the cycle that loads the last pixel (bbox_max_x, bbox_max_y) moves to DRAIN. Throughput is one pixel per enabled clock.
 
+
+=========================================================================
+
+
+TOP-LEVEL (FPGA BRING-UP) — rasterizer_top.v, raster_demo.v, tri_rom.v
+
+rasterizer_top (board level)
+Signal		Direction	Purpose
+clk		Input		100 MHz board clock
+rst_n		Input		Reset button, active high; the only user input.
+led[15:0]	Output		Display, mapping below
+
+LED map (led[0] = rightmost)
+led[9:0]	pixel_x
+led[10]		pixel_valid
+led[11]		idle_raster
+led[15:12]	{1'b0, state[2:0]}  (state codes as in dbg_state; led[15] always 0)
+
+raster_demo (helper, instantiated by rasterizer_top) generates every rasterizer input:
+- tri_rom: four precomputed test triangles (generated by gen_tri_rom.py), standing in for Triangle Setup: flat right triangle with the hypotenuse through pixel centers (tie test), depth-ramp triangle, triangle straddling x = 511/512, thin sliver.
+- Sequencer: waits GAP cycles (default 100,000,000 = 1 s at 100 MHz), presents a triangle with triangle_valid until the handshake (triangle_valid && idle_raster), waits for done_raster, advances to the next scene (wraps after the fourth), repeats.
+- Slow motion: busy_fbuffer is high except for one cycle every SLOW_DIV clocks, so the rasterizer advances one pixel per SLOW_DIV cycles and the LEDs are readable. Default SLOW_DIV = 12,500,000 (125 ms per pixel at 100 MHz); the counter is 32 bits wide, so any value up to about 4.29 billion fits. SLOW_DIV = 1 runs at full speed.
+
+Log bus (77 bits, output of raster_demo, tagged mark_debug in rasterizer_top so it can be probed with an ILA), MSB to LSB:
+[76:67] pixel_x, [66:57] pixel_y, [56:41] pixel_z, [40] pixel_valid, [39:24] pixel_color, [23] idle_raster, [22:20] state, [19:10] x_cur, [9:0] y_cur
