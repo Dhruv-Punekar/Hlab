@@ -9,7 +9,7 @@ module raster_demo #(
 )(
     input  wire        clk,
     input  wire        rst_n,          // async, active low
-    output wire [76:0] log
+    output wire [77:0] log
 );
     // ------------------------------------------------------------------
     // Slow-motion: busy_fbuffer is high except for one cycle per SLOW_DIV,
@@ -33,6 +33,7 @@ module raster_demo #(
     wire signed [33:0] edge0_C, edge1_C, edge2_C;
     wire signed [31:0] z_A, z_B, z_C;
     wire [15:0]        color_in;
+    wire                orient_neg;
 
     tri_rom u_rom (
         .scene(scene),
@@ -42,7 +43,7 @@ module raster_demo #(
         .edge1_A(edge1_A), .edge1_B(edge1_B), .edge1_C(edge1_C),
         .edge2_A(edge2_A), .edge2_B(edge2_B), .edge2_C(edge2_C),
         .z_A(z_A), .z_B(z_B), .z_C(z_C),
-        .color_in(color_in)
+        .color_in(color_in), .orient_neg(orient_neg)
     );
 
     // ------------------------------------------------------------------
@@ -63,7 +64,7 @@ module raster_demo #(
         .edge1_A(edge1_A), .edge1_B(edge1_B), .edge1_C(edge1_C),
         .edge2_A(edge2_A), .edge2_B(edge2_B), .edge2_C(edge2_C),
         .z_A(z_A), .z_B(z_B), .z_C(z_C),
-        .color_in(color_in),
+        .color_in(color_in), .orient_neg(orient_neg),
         .busy_fbuffer(busy_fbuffer),
         .pixel_x(pixel_x), .pixel_y(pixel_y), .pixel_z(pixel_z),
         .pixel_color(pixel_color), .pixel_valid(pixel_valid),
@@ -114,6 +115,7 @@ module raster_demo #(
     // ------------------------------------------------------------------
     // Log bus
     // ------------------------------------------------------------------
+    // Existing log fields retain their bit positions; orient_neg is appended at log[0].
     assign log = { pixel_x, pixel_y, pixel_z, pixel_valid, pixel_color,
-                   idle_raster, dbg_state, dbg_x_cur, dbg_y_cur };
+                   idle_raster, dbg_state, dbg_x_cur, dbg_y_cur, orient_neg };
 endmodule

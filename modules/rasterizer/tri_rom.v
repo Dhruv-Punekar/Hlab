@@ -6,9 +6,11 @@ module tri_rom (
     output reg  signed [31:0] edge0_A, edge0_B, edge1_A, edge1_B, edge2_A, edge2_B,
     output reg  signed [33:0] edge0_C, edge1_C, edge2_C,
     output reg  signed [31:0] z_A, z_B, z_C,
-    output reg  [15:0]        color_in
+    output reg  [15:0]        color_in,
+    output reg                 orient_neg
 );
     always @* begin
+        orient_neg = 1'b0;
         case (scene)
             2'd0: begin // flat right triangle (hypotenuse passes through pixel centres: tie test)
                 bbox_min_x = 10'd2; bbox_max_x = 10'd9; bbox_min_y = 10'd2; bbox_max_y = 10'd9;
@@ -34,11 +36,12 @@ module tri_rom (
                 z_A = 32'sd0; z_B = 32'sd0; z_C = 32'sd76800;
                 color_in = 16'h001F;
             end
-            2'd3: begin // thin sliver
+            2'd3: begin // thin sliver supplied back-facing; orient_neg restores edge signs
                 bbox_min_x = 10'd20; bbox_max_x = 10'd30; bbox_min_y = 10'd20; bbox_max_y = 10'd22;
-                edge0_A = -32'sd512; edge0_B = 32'sd2560; edge0_C = -34'sd10485760;
-                edge1_A = 32'sd256; edge1_B = -32'sd2560; edge1_C = 34'sd12451840;
-                edge2_A = 32'sd256; edge2_B = 32'sd0; edge2_C = -34'sd1310720;
+                orient_neg = 1'b1;
+                edge0_A = 32'sd512; edge0_B = -32'sd2560; edge0_C = 34'sd10485760;
+                edge1_A = -32'sd256; edge1_B = 32'sd2560; edge1_C = -34'sd12451840;
+                edge2_A = -32'sd256; edge2_B = 32'sd0; edge2_C = 34'sd1310720;
                 z_A = 32'sd0; z_B = 32'sd0; z_C = 32'sd12800;
                 color_in = 16'hFFE0;
             end

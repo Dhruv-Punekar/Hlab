@@ -15,7 +15,7 @@ module rasterizer_top (
 
     wire rst_n_sync = rst_sync[1];
 
-    (* mark_debug = "true" *) wire [76:0] log;
+    (* mark_debug = "true" *) wire [77:0] log;
 
     raster_demo #(
         .SLOW_DIV (100_000_000),
@@ -27,10 +27,10 @@ module rasterizer_top (
     );
 
     assign led = {
-        1'b0,
-        log[22:20],  // state
-        log[23],     // idle_raster
-        log[40],     // pixel_valid
-        log[76:67]   // pixel_x
-    };
+    log[0],       // LED15: orient_neg
+    log[23:21],   // LED14-12: actual FSM state
+    log[24],      // LED11: idle_raster
+    log[41],      // LED10: pixel_valid
+    log[77:68]    // LED9-0: pixel_x
+};
 endmodule
