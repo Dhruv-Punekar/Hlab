@@ -50,6 +50,7 @@ module rasterizer #(
     input  wire signed [EDGE_C_W-1:0] edge2_C,
     input  wire signed [COEF_W-1:0]  z_A, z_B, z_C,
     input  wire [COLOR_W-1:0]        color_in,
+    input  wire                      orient_neg,
 
     // ---- from Z-buffer / framebuffer controller ----
     input  wire                      busy_fbuffer,
@@ -112,9 +113,19 @@ module rasterizer #(
     wire signed [COEF_W-1:0] in_b [0:3];
     wire signed [COEF_W-1:0] in_c [0:3];
 
-    assign in_a[0] = edge0_A;  assign in_b[0] = edge0_B;  assign in_c[0] = conv_c(edge0_C);
-    assign in_a[1] = edge1_A;  assign in_b[1] = edge1_B;  assign in_c[1] = conv_c(edge1_C);
-    assign in_a[2] = edge2_A;  assign in_b[2] = edge2_B;  assign in_c[2] = conv_c(edge2_C);
+    wire signed [COEF_W-1:0]   n_a0 = orient_neg ? -edge0_A : edge0_A;
+    wire signed [COEF_W-1:0]   n_b0 = orient_neg ? -edge0_B : edge0_B;
+    wire signed [EDGE_C_W-1:0] n_c0 = orient_neg ? -edge0_C : edge0_C;
+    wire signed [COEF_W-1:0]   n_a1 = orient_neg ? -edge1_A : edge1_A;
+    wire signed [COEF_W-1:0]   n_b1 = orient_neg ? -edge1_B : edge1_B;
+    wire signed [EDGE_C_W-1:0] n_c1 = orient_neg ? -edge1_C : edge1_C;
+    wire signed [COEF_W-1:0]   n_a2 = orient_neg ? -edge2_A : edge2_A;
+    wire signed [COEF_W-1:0]   n_b2 = orient_neg ? -edge2_B : edge2_B;
+    wire signed [EDGE_C_W-1:0] n_c2 = orient_neg ? -edge2_C : edge2_C;
+
+    assign in_a[0] = n_a0;     assign in_b[0] = n_b0;     assign in_c[0] = conv_c(n_c0);
+    assign in_a[1] = n_a1;     assign in_b[1] = n_b1;     assign in_c[1] = conv_c(n_c1);
+    assign in_a[2] = n_a2;     assign in_b[2] = n_b2;     assign in_c[2] = conv_c(n_c2);
     assign in_a[3] = z_A;      assign in_b[3] = z_B;      assign in_c[3] = z_C;
 
     // ------------------------------------------------------------------
