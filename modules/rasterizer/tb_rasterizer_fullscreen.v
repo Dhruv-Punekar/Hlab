@@ -17,6 +17,9 @@
 //   6  big triangle clipped by the screen, hypotenuse x+y=399 passes through
 //      pixel centres (tie rule): expects exactly 75,150 pixels
 //   7  z plane across the whole screen incl. saturation at the top end
+// Every test is run twice: orient_neg=0 (original behaviour) and again with all edge
+// coefficients negated + orient_neg=1 (clockwise input as Triangle Setup presents it);
+// the screen-quad test uses true CW vertex order for the second pass. Same expectations.
 // Reference model is the same direct formula used in tb_rasterizer.v.
 // ============================================================================
 module tb_rasterizer_fullscreen;
@@ -31,6 +34,7 @@ module tb_rasterizer_fullscreen;
     reg  signed [31:0] e0a, e0b, e1a, e1b, e2a, e2b, za, zb, zc;
     reg  signed [33:0] e0c, e1c, e2c;
     reg  [15:0] color_in;
+    reg         orient_neg = 1'b0;   // Triangle Setup: input winding negative (edges are negated)
     reg         busy_fbuffer = 1'b0;
     wire [9:0]  pixel_x, pixel_y, dbg_x_cur, dbg_y_cur;
     wire [15:0] pixel_z, pixel_color;
@@ -45,6 +49,7 @@ module tb_rasterizer_fullscreen;
         .edge1_A(e1a), .edge1_B(e1b), .edge1_C(e1c),
         .edge2_A(e2a), .edge2_B(e2b), .edge2_C(e2c),
         .z_A(za), .z_B(zb), .z_C(zc), .color_in(color_in),
+        .orient_neg(orient_neg),
         .busy_fbuffer(busy_fbuffer),
         .pixel_x(pixel_x), .pixel_y(pixel_y), .pixel_z(pixel_z),
         .pixel_color(pixel_color), .pixel_valid(pixel_valid),
@@ -58,6 +63,8 @@ module tb_rasterizer_fullscreen;
     reg [15:0] exp_z [0:NPIX-1];
     reg [15:0] exp_c;
     integer n_exp, got_idx;
+    reg [63:0] exp_hash, last_hash;
+    integer last_n = 0, neg_runs = 0, neg_px = 0;
     integer errors = 0, tests = 0, total_px = 0, shown = 0;
 
     
@@ -74,23 +81,35 @@ module tb_rasterizer_fullscreen;
     task compute_expected;
         integer x, y;
         reg signed [63:0] xx, yy, c0, c1, c2, E0, E1, E2, Z, zs;
+        reg signed [63:0] a0, b0, a1, b1, a2, b2, k0, k1, k2;
         begin
-            n_exp = 0;
-            c0 = conv_c(e0c); c1 = conv_c(e1c); c2 = conv_c(e2c);
+            n_exp = 0;  exp_hash = 64'd0;
+            // orient_neg = 1 : the edges that count are the NEGATED inputs (A, B and C of
+            // all three edges; C is negated before the Q18.16 -> Q24.8 conversion).
+            a0 = e0a; b0 = e0b; k0 = e0c;
+            a1 = e1a; b1 = e1b; k1 = e1c;
+            a2 = e2a; b2 = e2b; k2 = e2c;
+            if (orient_neg) begin
+                a0 = -a0; b0 = -b0; k0 = -k0;
+                a1 = -a1; b1 = -b1; k1 = -k1;
+                a2 = -a2; b2 = -b2; k2 = -k2;
+            end
+            c0 = conv_c(k0); c1 = conv_c(k1); c2 = conv_c(k2);
             exp_c = color_in;
             for (y = bbox_min_y; y <= bbox_max_y; y = y + 1)
                 for (x = bbox_min_x; x <= bbox_max_x; x = x + 1) begin
                     xx = 2*x + 1;  yy = 2*y + 1;
-                    E0 = 2*c0 + e0a*xx + e0b*yy;
-                    E1 = 2*c1 + e1a*xx + e1b*yy;
-                    E2 = 2*c2 + e2a*xx + e2b*yy;
+                    E0 = 2*c0 + a0*xx + b0*yy;
+                    E1 = 2*c1 + a1*xx + b1*yy;
+                    E2 = 2*c2 + a2*xx + b2*yy;
                     if (E0 >= 0 && E1 >= 0 && E2 >= 0) begin
-                        Z  = 2*zc + za*xx + zb*yy;
+                        Z  = 2*zc + za*xx + zb*yy;      // depth plane is never negated
                         zs = Z >>> 5;
                         if (zs >  32767) zs =  32767;
                         if (zs < -32768) zs = -32768;
                         exp_x[n_exp] = x;  exp_y[n_exp] = y;
                         exp_z[n_exp] = zs[15:0];
+                        exp_hash = exp_hash * 64'd31 + {28'd0, x[9:0], y[9:0], zs[15:0]};
                         n_exp = n_exp + 1;
                     end
                 end
@@ -181,6 +200,37 @@ module tb_rasterizer_fullscreen;
         end
     endtask
 
+    // ------------------------------------------------------------------
+    // orient_neg support: negate the loaded edges (what Triangle Setup presents for D < 0)
+    // ------------------------------------------------------------------
+    task negate_edges;
+        begin
+            e0a = -e0a;  e0b = -e0b;  e0c = -e0c;
+            e1a = -e1a;  e1b = -e1b;  e1c = -e1c;
+            e2a = -e2a;  e2b = -e2b;  e2c = -e2c;
+        end
+    endtask
+
+    task apply_pol;                          // 0: as loaded, orient_neg=0   1: negated edges, orient_neg=1
+        input p;
+        begin
+            if (p) begin negate_edges; orient_neg = 1'b1; end
+            else   orient_neg = 1'b0;
+        end
+    endtask
+
+    task set_verts_ordered;               // vertices used IN THE GIVEN ORDER; orient_neg = (det < 0); z flat
+        input integer x0, y0, x1, y1, x2, y2;
+        integer det;
+        begin
+            det = (x1-x0)*(y2-y0) - (x2-x0)*(y1-y0);
+            orient_neg = (det < 0);
+            set_edge(0, x0, y0, x1, y1);
+            set_edge(1, x1, y1, x2, y2);
+            set_edge(2, x2, y2, x0, y0);
+        end
+    endtask
+
     task set_screen_bbox;
         begin bbox_min_x = 0; bbox_max_x = W-1; bbox_min_y = 0; bbox_max_y = H-1; end
     endtask
@@ -189,18 +239,19 @@ module tb_rasterizer_fullscreen;
     reg signed [31:0] s_e0a, s_e0b, s_e1a, s_e1b, s_e2a, s_e2b, s_za, s_zb, s_zc;
     reg signed [33:0] s_e0c, s_e1c, s_e2c;
     reg [15:0] s_col;
+    reg        s_neg;
     task save_inputs;
         begin
             s_bx0 = bbox_min_x; s_bx1 = bbox_max_x; s_by0 = bbox_min_y; s_by1 = bbox_max_y;
             s_e0a = e0a; s_e0b = e0b; s_e0c = e0c; s_e1a = e1a; s_e1b = e1b; s_e1c = e1c;
-            s_e2a = e2a; s_e2b = e2b; s_e2c = e2c; s_za = za; s_zb = zb; s_zc = zc; s_col = color_in;
+            s_e2a = e2a; s_e2b = e2b; s_e2c = e2c; s_za = za; s_zb = zb; s_zc = zc; s_col = color_in; s_neg = orient_neg;
         end
     endtask
     task restore_inputs;
         begin
             bbox_min_x = s_bx0; bbox_max_x = s_bx1; bbox_min_y = s_by0; bbox_max_y = s_by1;
             e0a = s_e0a; e0b = s_e0b; e0c = s_e0c; e1a = s_e1a; e1b = s_e1b; e1c = s_e1c;
-            e2a = s_e2a; e2b = s_e2b; e2c = s_e2c; za = s_za; zb = s_zb; zc = s_zc; color_in = s_col;
+            e2a = s_e2a; e2b = s_e2b; e2c = s_e2c; za = s_za; zb = s_zb; zc = s_zc; color_in = s_col; orient_neg = s_neg;
         end
     endtask
     task scramble_inputs;
@@ -209,7 +260,7 @@ module tb_rasterizer_fullscreen;
             e0a = $urandom; e0b = $urandom; e1a = $urandom; e1b = $urandom; e2a = $urandom; e2b = $urandom;
             za = $urandom; zb = $urandom; zc = $urandom;
             e0c = {$urandom, $urandom}; e1c = {$urandom, $urandom}; e2c = {$urandom, $urandom};
-            color_in = $urandom;
+            color_in = $urandom;  orient_neg = $urandom;
         end
     endtask
 
@@ -254,14 +305,15 @@ module tb_rasterizer_fullscreen;
                 if (done_cnt - dc_before !== 1)     begin errors = errors + 1; $display("ERR done pulse count"); end
             end
             tests = tests + 1;
-            $display("%-34s stall=%0d  valid px=%6d / %0d scanned  cycles=%0d  %0s",
-                     name, mode, n_exp, (bbox_max_x-bbox_min_x+1)*(bbox_max_y-bbox_min_y+1), last_cycles,
+            if (orient_neg) begin neg_runs = neg_runs + 1; neg_px = neg_px + n_exp; end
+            $display("%-34s neg=%0d stall=%0d  valid px=%6d / %0d scanned  cycles=%0d  %0s",
+                     name, orient_neg, mode, n_exp, (bbox_max_x-bbox_min_x+1)*(bbox_max_y-bbox_min_y+1), last_cycles,
                      (errors == e_before) ? "ok" : "FAIL");
         end
     endtask
 
     // ---------------- sequence ----------------
-    integer holes, overlaps, e_q;
+    integer holes, overlaps, e_q, pol;
     initial begin
         $display("Running full screen test");
             
@@ -271,10 +323,15 @@ module tb_rasterizer_fullscreen;
         #37 rst_n = 1'b1;
         repeat (4) @(posedge clk);
 
+        for (pol = 0; pol < 2; pol = pol + 1) begin
+        $display("==== orient_neg = %0d : %0s ====", pol,
+                 pol ? "all edges negated + orient_neg=1 (clockwise input)" : "edges as before, orient_neg=0");
+
         // ---- 1-4: triangle that contains the whole screen -> every pixel valid ----
         color_in = 16'hF800;
         set_edge_raw(0, 1,0,10);  set_edge_raw(1, 0,1,10);  set_edge_raw(2, -1,-1,700);  set_screen_bbox;
         za = 0; zb = 0; zc = 32'sd25600;
+        apply_pol(pol);
         do_triangle(0, "full-cover tri, no stall");
         if (n_exp !== NPIX) begin errors = errors + 1; $display("ERR full-cover triangle should cover all %0d pixels, model says %0d", NPIX, n_exp); end
         if (last_cycles > NPIX + 16) begin errors = errors + 1; $display("ERR scan not 1 pixel/clock: %0d cycles for %0d pixels", last_cycles, NPIX); end
@@ -283,12 +340,20 @@ module tb_rasterizer_fullscreen;
         do_triangle(2, "full-cover tri, burst stall");
 
         // ---- 5: screen quad as two triangles: each pixel exactly once ----
+        // pass 0: positive-orientation vertex order (as before); pass 1: clockwise vertex order -> orient_neg=1
         for (i = 0; i < NPIX; i = i + 1) cov[i] = 2'd0;
         cov_on = 1'b1;  e_q = errors;
-        color_in = 16'h07E0;  set_verts(0,0, 300,0, 0,400);     set_screen_bbox; za = 0; zb = 0; zc = 32'sd1280;
-        do_triangle(0, "quad: triangle A");
-        color_in = 16'h001F;  set_verts(300,0, 300,400, 0,400); set_screen_bbox; za = 0; zb = 0; zc = 32'sd2560;
-        do_triangle(0, "quad: triangle B");
+        if (pol == 0) begin
+            color_in = 16'h07E0;  set_verts(0,0, 300,0, 0,400);     set_screen_bbox; za = 0; zb = 0; zc = 32'sd1280;
+            do_triangle(0, "quad: triangle A");
+            color_in = 16'h001F;  set_verts(300,0, 300,400, 0,400); set_screen_bbox; za = 0; zb = 0; zc = 32'sd2560;
+            do_triangle(0, "quad: triangle B");
+        end else begin
+            color_in = 16'h07E0;  set_verts_ordered(0,0, 0,400, 300,0);     set_screen_bbox; za = 0; zb = 0; zc = 32'sd1280;
+            do_triangle(0, "quad: triangle A (CW order)");
+            color_in = 16'h001F;  set_verts_ordered(300,0, 0,400, 300,400); set_screen_bbox; za = 0; zb = 0; zc = 32'sd2560;
+            do_triangle(0, "quad: triangle B (CW order)");
+        end
         cov_on = 1'b0;
         holes = 0; overlaps = 0;
         for (i = 0; i < NPIX; i = i + 1) begin
@@ -305,6 +370,7 @@ module tb_rasterizer_fullscreen;
         // ---- 6: tie rule: hypotenuse x+y = 400 passes through centres of x+y = 399 ----
         color_in = 16'hFFE0;
         set_edge_raw(0, 1,0,0);  set_edge_raw(1, 0,1,0);  set_edge_raw(2, -1,-1,400);  set_screen_bbox;  za = 0; zb = 0; zc = 32'sd256;
+        apply_pol(pol);
         do_triangle(0, "tie rule, clipped triangle");
         if (n_exp !== 75150) begin errors = errors + 1; $display("ERR tie test: expected 75150 pixels, got %0d", n_exp); end
 
@@ -312,9 +378,24 @@ module tb_rasterizer_fullscreen;
         color_in = 16'h1357;
         set_edge_raw(0, 1,0,10);  set_edge_raw(1, 0,1,10);  set_edge_raw(2, -1,-1,700);  set_screen_bbox;
         za = 32'sd1536; zb = 32'sd1024; zc = 32'sd256 * 5;
+        apply_pol(pol);
         do_triangle(1, "z plane + saturation, 50% stall");
 
+        orient_neg = 1'b0;
+        end   // pol
+
+        // ---- control: negated edges WITHOUT orient_neg are an empty region -> no pixels ----
+        color_in = 16'hFFFF;
+        set_edge_raw(0, 1,0,10);  set_edge_raw(1, 0,1,10);  set_edge_raw(2, -1,-1,700);  set_screen_bbox;
+        za = 0; zb = 0; zc = 32'sd256;
+        negate_edges;  orient_neg = 1'b0;
+        do_triangle(0, "CW edges, orient_neg=0 (culled)");
+        if (n_exp !== 0) begin errors = errors + 1; $display("ERR negated edges without orient_neg should give 0 pixels, model %0d", n_exp); end
+        orient_neg = 1'b0;
+
         $display("--------------------------------------------------------------");
+        $display("orient_neg=1 runs=%0d  pixels in those runs=%0d", neg_runs, neg_px);
+        if (neg_runs == 0 || neg_px == 0) begin errors = errors + 1; $display("ERR orient_neg path not exercised"); end
         $display("tests=%0d  pixels checked=%0d  errors=%0d", tests, total_px, errors);
         if (errors == 0) $display("PASS"); else $display("FAIL");
         $finish;
