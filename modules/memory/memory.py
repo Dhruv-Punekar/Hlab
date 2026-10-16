@@ -1,91 +1,104 @@
-import struct
+#!/usr/bin/env python3
+"""
+memory.py - Generates vertices.mem and matrix.mem for the testbench.
 
-def float_to_fp32_hex(f):
-    """Converts a float to a 32-bit IEEE 754 (FP32) hex string."""
-    packed = struct.pack('>f', f)
-    ival = struct.unpack('>I', packed)[0]
-    return f"{ival:08x}"
+Follows initial_modules.txt:
+  * Q24.8 fixed point, 32-bit two's complement   (value = int / 256.0)
+  * RGB565 colour, 16 bit
+  * Vertex word = {X[31:0], Y[31:0], Z[31:0], W[31:0], R[4:0], G[5:0], B[4:0]}  (144 bit = 36 hex digits)
+  * Cube = 6 faces x 2 triangles x 3 vertices = 36 vertices, one colour per face
+  * Matrix = 16 x 32-bit Q24.8 elements
 
-def float_to_q24_8_hex(val):
-    """Converts a float to a 32-bit Q24.8 fixed-point hex string."""
-    fixed_val = int(val * 256)
-    if fixed_val < 0:
-        fixed_val = fixed_val & 0xFFFFFFFF # Handle Two's Complement
-    return f"{fixed_val:08x}"
+Usage:
+  python3 memory.py                    # identity matrix, 36 vertices
+  python3 memory.py --rot-z 30         # 30 degree rotation about Z instead of identity
+  python3 memory.py --pad 64           # pad vertices.mem with zero words up to 64 lines
+"""
+import argparse
+import math
 
-def rgb_to_rgb565_hex(r, g, b):
-    """Packs 8-bit RGB channels into a 16-bit RGB565 hex string."""
-    r5 = (r >> 3) & 0x1F
-    g6 = (g >> 2) & 0x3F
-    b5 = (b >> 3) & 0x1F
-    val = (r5 << 11) | (g6 << 5) | b5
-    return f"{val:04x}"
+FRAC = 8
+MASK32 = 0xFFFFFFFF
 
-def generate_vertices_mem(filename="vertices.mem"):
-    """
-    Generates a 3D cube (36 vertices) and writes them line-by-line.
-    Packing Strategy: {X[31:0], Y[31:0], Z[31:0], W[31:0], R[4:0], G[5:0], B[4:0]}
-    """
-    # Define cube corners
-    p0 = (-0.5, -0.5, -0.5)
-    p1 = ( 0.5, -0.5, -0.5)
-    p2 = ( 0.5,  0.5, -0.5)
-    p3 = (-0.5,  0.5, -0.5)
-    p4 = (-0.5, -0.5,  0.5)
-    p5 = ( 0.5, -0.5,  0.5)
-    p6 = ( 0.5,  0.5,  0.5)
-    p7 = (-0.5,  0.5,  0.5)
 
-    # 12 Triangles (2 per face) with specific RGB colors
-    triangles = [
-        (p4, p5, p6, (255, 0, 0)),   (p4, p6, p7, (255, 0, 0)),   # Front (Red)
-        (p1, p0, p3, (0, 255, 255)), (p1, p3, p2, (0, 255, 255)), # Back (Cyan)
-        (p0, p4, p7, (0, 255, 0)),   (p0, p7, p3, (0, 255, 0)),   # Left (Green)
-        (p5, p1, p2, (255, 0, 255)), (p5, p2, p6, (255, 0, 255)), # Right (Magenta)
-        (p7, p6, p2, (0, 0, 255)),   (p7, p2, p3, (0, 0, 255)),   # Top (Blue)
-        (p0, p1, p5, (255, 255, 0)), (p0, p5, p4, (255, 255, 0))  # Bottom (Yellow)
-    ]
+def to_q24_8(x: float) -> int:
+    """Float -> Q24.8 two's complement (round to nearest)."""
+    return int(round(x * (1 << FRAC))) & MASK32
 
-    with open(filename, "w") as f:
-        for tri in triangles:
-            color = tri[3]
-            hcol = rgb_to_rgb565_hex(*color)
-            
-            # Write 3 vertices per triangle
-            for i in range(3):
-                x, y, z = tri[i]
-                w = 1.0
-                
-                hx = float_to_fp32_hex(x)
-                hy = float_to_fp32_hex(y)
-                hz = float_to_fp32_hex(z)
-                hw = float_to_fp32_hex(w)
-                
-                # Combine exactly as defined: {X, Y, Z, W, RGB565}
-                vertex_hex = f"{hx}{hy}{hz}{hw}{hcol}"
-                f.write(vertex_hex + "\n")
-                
-    print(f"Generated {filename} (36 lines, 144-bits each).")
 
-def generate_matrix_mem(filename="matrix.mem"):
-    """
-    Generates a 4x4 Identity Matrix in Q24.8 format.
-    Written as 16 separate 32-bit lines so $readmemh can load it 
-    into the reg [31:0] matrix_regs [0:15] array.
-    """
-    matrix = [
-        1.0, 0.0, 0.0, 0.0,
-        0.0, 1.0, 0.0, 0.0,
-        0.0, 0.0, 1.0, 0.0,
-        0.0, 0.0, 0.0, 1.0
-    ]
-    
-    with open(filename, "w") as f:
-        for element in matrix:  # Corrected from "isn" to "in"
-            f.write(float_to_q24_8_hex(element) + "\n")
-            
-    print(f"Generated {filename} (16 lines, 32-bits each).")
+def rgb565(r8: int, g8: int, b8: int) -> int:
+    return ((r8 >> 3) << 11) | ((g8 >> 2) << 5) | (b8 >> 3)
+
+
+def pack_vertex(x, y, z, w, color16) -> int:
+    return (
+        (to_q24_8(x) << 112)
+        | (to_q24_8(y) << 80)
+        | (to_q24_8(z) << 48)
+        | (to_q24_8(w) << 16)
+        | (color16 & 0xFFFF)
+    )
+
+
+# Each face: 4 corners (CCW seen from outside) + a colour.
+FACES = [
+    ([(-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1)],        rgb565(255, 0, 0)),     # +Z red
+    ([(-1, -1, -1), (-1, 1, -1), (1, 1, -1), (1, -1, -1)],    rgb565(0, 255, 0)),     # -Z green
+    ([(1, -1, -1), (1, 1, -1), (1, 1, 1), (1, -1, 1)],        rgb565(0, 0, 255)),     # +X blue
+    ([(-1, -1, -1), (-1, -1, 1), (-1, 1, 1), (-1, 1, -1)],    rgb565(255, 255, 0)),   # -X yellow
+    ([(-1, 1, -1), (-1, 1, 1), (1, 1, 1), (1, 1, -1)],        rgb565(0, 255, 255)),   # +Y cyan
+    ([(-1, -1, -1), (1, -1, -1), (1, -1, 1), (-1, -1, 1)],    rgb565(255, 0, 255)),   # -Y magenta
+]
+
+
+def cube_vertices():
+    words = []
+    for corners, col in FACES:
+        v0, v1, v2, v3 = corners
+        for tri in ((v0, v1, v2), (v0, v2, v3)):
+            for (x, y, z) in tri:
+                words.append(pack_vertex(x, y, z, 1.0, col))
+    assert len(words) == 36
+    return words
+
+
+def matrix_words(rot_z_deg):
+    if rot_z_deg is None:
+        m = [1, 0, 0, 0,
+             0, 1, 0, 0,
+             0, 0, 1, 0,
+             0, 0, 0, 1]
+    else:
+        a = math.radians(rot_z_deg)
+        c, s = math.cos(a), math.sin(a)
+        m = [c, -s, 0, 0,
+             s,  c, 0, 0,
+             0,  0, 1, 0,
+             0,  0, 0, 1]
+    return [to_q24_8(e) for e in m]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--rot-z", type=float, default=None, help="use a Z rotation (deg) instead of identity")
+    ap.add_argument("--pad", type=int, default=0, help="pad vertices.mem with zero words up to N lines")
+    ap.add_argument("--outdir", default=".")
+    args = ap.parse_args()
+
+    verts = cube_vertices()
+    with open(f"{args.outdir}/vertices.mem", "w") as f:
+        for w in verts:
+            f.write(f"{w:036x}\n")
+        for _ in range(max(0, args.pad - len(verts))):
+            f.write(f"{0:036x}\n")
+
+    with open(f"{args.outdir}/matrix.mem", "w") as f:
+        for w in matrix_words(args.rot_z):
+            f.write(f"{w:08x}\n")
+
+    print(f"vertices.mem: {max(len(verts), args.pad)} lines, matrix.mem: 16 lines "
+          f"({'identity' if args.rot_z is None else f'rot-z {args.rot_z} deg'})")
+
 
 if __name__ == "__main__":
-    generate_vertices_mem("vertices.mem")
-    generate_matrix_mem("matrix.mem")
+    main()
