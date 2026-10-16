@@ -1,0 +1,46 @@
+========================================================================
+Z-BUFFER & FRAMEBUFFER - TECHNICAL SPECIFICATIONS
+========================================================================
+
+1. OVERVIEW
+This module acts as the final memory backend for the 3D graphics pipeline. 
+It securely stores the color and depth values of the generated pixels, 
+manages visibility (occlusion), and safely streams the output to the 
+VGA controller.
+- Architecture: Single Buffered (Fits natively in internal BRAM)
+- Memory Primitives: Explicitly mapped via (* ram_style = "block" *) to Xilinx RAMB36/RAMB18
+- Resolution: 300x400
+- Color Format: 16-bit RGB565
+- Depth Format: 16-bit Unsigned Integer
+- Pipeline Architecture: 3-Stage (Read -> Compare -> Write)
+
+2. MVP ADDITIONS (Hardware Safety)
+To ensure the hardware does not crash or corrupt memory:
+- Hardware Bounds Checking: Before Stage 1 accepts a pixel from the 
+  Rasterizer, it verifies that (X < 300) and (Y < 400). Invalid pixels 
+  are instantly dropped.
+- Clock Domain Crossing (CDC): The VGA display reads from Port B using 
+  an independent `clk_vga` clock, fully isolating the 25 MHz monitor 
+  timing from the 100 MHz rendering pipeline.
+
+3. 3-STAGE PIPELINE & DATA FORWARDING
+The module accepts 1 pixel per clock cycle without stalling.
+- Stage 1 (Read): Computes the 1D address `(Y * W) + X` and requests 
+  the old Z-value from the BRAM.
+- Stage 2 (Compare): Evaluates `(new_Z < old_Z)`.
+- Stage 3 (Write): Commits the new color and depth to memory.
+
+To prevent Data Hazards (where the Rasterizer outputs two pixels at the 
+exact same X,Y coordinate back-to-back), a Forwarding Path is implemented. 
+If Stage 2 detects that Stage 3 is currently holding a write for the exact 
+same memory address, it ignores the BRAM output and compares against the 
+forwarded Z-value from Stage 3.
+
+4. FAST CLEAR FSM
+Upon reset, the hardware enters the `STATE_CLEAR` mode. The `busy` flag 
+is asserted, pausing the Rasterizer. A counter loops through all 120,000 
+addresses of the memory, setting Color to `16'h0000` (Black) and Depth 
+to `16'hFFFF` (Infinity). At 100MHz, this wipe completes in exactly 1.2 
+milliseconds, at which point the module signals `clear_done` and awaits 
+the first pixel.
+========================================================================
