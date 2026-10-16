@@ -1,5 +1,6 @@
 `timescale 1ns / 1ps
 
+
 // ============================================================================
 // Module: vertex_memory
 // Purpose: Stores the 144-bit vertices of the 3D model. 
