@@ -78,6 +78,11 @@ module z_f_buffer #(
     reg [18:0] s3_addr;
     reg [15:0] s3_z, s3_color;
 
+    // --- STAGE 4 REGISTERS (Distance-2 RAW Hazard Bypass) ---
+    reg s4_we;
+    reg [18:0] s4_addr;
+    reg [15:0] s4_z;
+
     // ========================================================================
     // PIPELINE EXECUTION
     // ========================================================================
@@ -85,7 +90,7 @@ module z_f_buffer #(
         if (!rst_n) begin
             state <= STATE_CLEAR;
             clear_addr <= 0;
-            s1_valid <= 0; s2_valid <= 0; s3_we <= 0;
+            s1_valid <= 0; s2_valid <= 0; s3_we <= 0; s4_we <= 0;
         end else begin
             
             // ----------------------------------------------------------------
@@ -103,7 +108,7 @@ module z_f_buffer #(
                     state <= STATE_IDLE;
                 end
                 
-                s1_valid <= 0; s2_valid <= 0; s3_we <= 0;
+                s1_valid <= 0; s2_valid <= 0; s3_we <= 0; s4_we <= 0;
             end 
             // ----------------------------------------------------------------
             // RENDER PIPELINE
@@ -131,19 +136,27 @@ module z_f_buffer #(
                 s2_old_z <= z_buffer[s1_addr]; 
 
                 // ------------------------------------------------------------
-                // STAGE 3: WRITE (With Data Forwarding)
+                // STAGE 3: WRITE (With Distance-1 & Distance-2 Forwarding)
                 // ------------------------------------------------------------
                 s3_addr <= s2_addr;
                 s3_z <= s2_z;
                 s3_color <= s2_color;
                 
-                // DATA FORWARDING: If the pixel currently in Stage 3 is writing 
-                // to the exact same address as the pixel in Stage 2, the BRAM 
-                // read `s2_old_z` is stale! We must forward the pending Z-value.
+                // Track committed write for Distance-2 hazard bypass
+                s4_we   <= s3_we;
+                s4_addr <= s3_addr;
+                s4_z    <= s3_z;
+
+                // DATA FORWARDING (Distance-1 & Distance-2 RAW Hazard Bypass):
+                // Distance 1: Pixel in Stage 3 is writing to the same address.
+                // Distance 2: Pixel in Stage 4 committed a write on the exact same
+                //             clock edge that Stage 2 sampled BRAM (stale read).
                 if (s3_we && (s3_addr == s2_addr)) begin
-                    s3_we <= s2_valid && (s2_z < s3_z); // Compare against forwarded Z
+                    s3_we <= s2_valid && (s2_z < s3_z);  // Distance-1 Forwarding
+                end else if (s4_we && (s4_addr == s2_addr)) begin
+                    s3_we <= s2_valid && (s2_z < s4_z);  // Distance-2 Forwarding
                 end else begin
-                    s3_we <= s2_valid && (s2_z < s2_old_z); // Compare against BRAM Z
+                    s3_we <= s2_valid && (s2_z < s2_old_z); // Normal BRAM Read
                 end
 
                 // Execute the actual memory write

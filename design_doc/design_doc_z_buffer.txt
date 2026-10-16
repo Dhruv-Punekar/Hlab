@@ -30,11 +30,9 @@ The module accepts 1 pixel per clock cycle without stalling.
 - Stage 2 (Compare): Evaluates `(new_Z < old_Z)`.
 - Stage 3 (Write): Commits the new color and depth to memory.
 
-To prevent Data Hazards (where the Rasterizer outputs two pixels at the 
-exact same X,Y coordinate back-to-back), a Forwarding Path is implemented. 
-If Stage 2 detects that Stage 3 is currently holding a write for the exact 
-same memory address, it ignores the BRAM output and compares against the 
-forwarded Z-value from Stage 3.
+To prevent Data Hazards (where pixels hit the exact same X,Y coordinate in close succession), a Dual-Distance Forwarding Network is implemented:
+- Distance-1 Bypass: If Stage 2 detects that Stage 3 is currently holding a write for the exact same memory address (back-to-back pixels), it bypasses BRAM and compares against the forwarded Z-value from Stage 3.
+- Distance-2 Bypass: If two pixels hit the exact same address with 1 intermediate pixel between them, the first pixel's write lands on the exact same clock edge that the second pixel reads BRAM (causing a stale BRAM read). The Stage 4 registers retain the committed write and forward its Z-value to Stage 2, preventing farther pixels from overwriting nearer ones.
 
 4. FAST CLEAR FSM
 Upon reset, the hardware enters the `STATE_CLEAR` mode. The `busy` flag 
