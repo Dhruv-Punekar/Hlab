@@ -248,7 +248,7 @@ module tb_pipeline_memfiles #(
             r_pix = r_pix + 1;
             if (r_pix <= 3)
                 $fdisplay(lg, "[%6d] RAST->ZBUF tri%0d pixel #%0d (x=%0d, y=%0d) z=0x%h (%6.3f) col=%h",
-                    cyc, r_tri, r_pix, dut.rs_px, dut.rs_py, dut.rs_pz, $signed(dut.rs_pz) / 256.0, dut.rs_pcolor);
+                    cyc, r_tri, r_pix, dut.rs_px, dut.rs_py, dut.rs_pz, $signed(dut.rs_pz) / 16.0, dut.rs_pcolor);
             last_x = dut.rs_px; last_y = dut.rs_py; last_z = dut.rs_pz;
         end
         if (dut.rast_done) begin

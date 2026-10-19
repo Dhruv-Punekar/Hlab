@@ -29,7 +29,7 @@ module hardware_pipeline #(
     parameter RECIP_LUT_FILE  = "recip_lut_q1_17.mem",
     parameter LOOP_RENDER     = 0,      // 1: re-send the model forever
     // ---- depth precision ----
-    parameter Z_FRAC_OUT       = 8      // rasterizer pixel_z fraction bits (Q8.8; module default 4)
+    parameter Z_FRAC_OUT       = 4      // rasterizer pixel_z fraction bits (Q12.4; module default 4)
 )(
     input  wire       clk,        // 100 MHz
     input  wire       clk_vga,    // 25 MHz
