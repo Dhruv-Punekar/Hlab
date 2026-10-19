@@ -1,4 +1,5 @@
 RASTERIZER INPUTS
+--------------------------------------
 
 A. Triangle data — from Triangle Setup
 Signal					Width					Purpose
@@ -29,6 +30,7 @@ busy_fbuffer		Input		Z-buffer/framebuffer controller cannot accept pixels, e.g. 
 
 
 RASTERIZER OUTPUTS
+--------------------------------------
 
 A. DATA OUTPUTS
 Signal					Width					Purpose
@@ -43,7 +45,7 @@ pixel_valid			Pixel data is valid for the Z-buffer
 idle_raster			Rasterizer is idle
 done_raster			Rasterization of the triangle has completed
 
-C. Debug outputs (observation only, not part of the Z-buffer interface)
+C. Debug outputs 
 Signal					Width					Purpose
 dbg_state				3 bits				FSM state: IDLE 0, INIT_A 1, INIT_B 2, SCAN 3, DRAIN 4, FINISH 5
 dbg_x_cur				10 bits				X coordinate of the pixel currently being evaluated
@@ -93,7 +95,16 @@ Accumulators are 48 bits signed. Start value at the center of (xmin, ymin) = 2c 
 
 15. Edge constant: edge C arrives as Q18.16 and is converted to Q24.8 at the capture edge by an arithmetic shift of 8 with rounding half away from zero (parameter C_ROUND = 1), so C(-edge) == -C(edge) and shared edges stay consistent. Limit: |C| must be below 2^17 = 131072 in real units (34-bit input). For a 300 x 400 screen with vertices at screen coordinates the largest value is about 400 * 300 = 120,000, which fits; larger screens or vertices far from the origin need Triangle Setup to scale or translate the coefficients (only the sign of E matters, so all of A, B, C of an edge may be scaled by the same positive factor).
 
+16. PIPELINE LEVEL CONNECTION
+	pipe.discard = setup.degenerate || setup.overflow
+	raster.triangle_valid = setup.out_valid && !pipe.discard
+	setup.out_ready = rasterizer.idle_raster  || pipe.discard
+	raster.orient_neg = setup.orient_neg
+
+
+-------------------
 1. FSM
+-------------------
 State				Purpose										
 IDLE		idle_raster = 1. Latch the triangle when triangle_valid is high.	On the capture edge go to INIT_A, set idle_raster <= 0.
 INIT_A		Compute the offset term and the two products (a·xmin, b·ymin).		Next cycle, to INIT_B.
