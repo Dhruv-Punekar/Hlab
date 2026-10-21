@@ -1,0 +1,226 @@
+========================================================================
+TRIANGLE SETUP UNIT - TECHNICAL SPECIFICATIONS
+========================================================================
+
+RTL:      individual_modules/triangle_setup/triangle_setup_unit_bbox.v
+          (module triangle_setup_unit_debug; identical copy in
+          hardware_pipeline/triangle_setup_unit_bbox.v)
+LUT:      recip_lut_q1_17.mem (1024 x 18-bit)
+Target:   Artix-7 100T (xc7a100tcsg324-1), 100 MHz
+
+
+1. OVERVIEW
+Sits between the Projection Engine and the Rasterizer. Takes one
+screen-space triangle (three vertices + one face colour) and produces
+everything the Rasterizer needs to scan it:
+- an inclusive integer pixel bounding box
+- three edge equations   E_i(x, y) = A_i * x + B_i * y + C_i
+- a depth plane          z(x, y)   = zA * x + zB * y + zC
+- the face colour and status flags
+- Throughput: one triangle per clock (II = 1) when the output is not stalled
+- Latency: 18 clocks (default, RECIP_NR = 1) or 14 clocks (RECIP_NR = 0)
+- Arithmetic: fixed point only, no floating point, no divider
+
+
+2. PARAMETERS
+Parameter		Default				Purpose
+RECIP_LUT_FILE		"recip_lut_q1_17.mem"		Reciprocal LUT loaded with $readmemh
+RECIP_NR		1				1 = one Newton-Raphson step refines the
+							LUT reciprocal (+4 clocks, +2 DSP).
+							0 = LUT value used directly.
+The localparam LATENCY holds the exact latency for the chosen setting.
+
+
+3. INPUTS
+Signal				Width				Purpose
+clk				1				System clock (100 MHz)
+rst_n				1				Asynchronous active-low reset
+in_valid			1				Input triangle is valid
+in_x0, in_y0, in_z0		32 bits each, signed, Q24.8	Vertex 0
+in_x1, in_y1, in_z1		32 bits each, signed, Q24.8	Vertex 1
+in_x2, in_y2, in_z2		32 bits each, signed, Q24.8	Vertex 2
+in_face_color			16 bits				RGB565, one colour per face
+out_ready			1				Downstream can take the output
+
+Input contract: post-clipping screen space, x in [0, 300.0] and
+y in [0, 400.0] (raw 0..76800 and 0..102400). Endpoints are legal.
+z may be any 32-bit Q24.8 value.
+
+
+4. OUTPUTS
+A. Handshake
+Signal				Width				Purpose
+in_ready			1				A triangle can be accepted this cycle
+out_valid			1				Output payload is valid
+
+B. Triangle payload
+Signal				Width				Purpose
+bbox_xmin, bbox_xmax		10 bits each, unsigned		Inclusive pixel columns, 0..299
+bbox_ymin, bbox_ymax		10 bits each, unsigned		Inclusive pixel rows, 0..399
+edge0_A, edge0_B		32 bits each, signed, Q24.8	Edge 0 (vertex 0 -> 1) coefficients
+edge0_C				34 bits, signed, Q18.16		Edge 0 constant
+edge1_A, edge1_B		32 bits each, signed, Q24.8	Edge 1 (vertex 1 -> 2) coefficients
+edge1_C				34 bits, signed, Q18.16		Edge 1 constant
+edge2_A, edge2_B		32 bits each, signed, Q24.8	Edge 2 (vertex 2 -> 0) coefficients
+edge2_C				34 bits, signed, Q18.16		Edge 2 constant
+zA, zB, zC			32 bits each, signed, Q24.8	Depth plane coefficients
+face_color			16 bits				RGB565, passed through
+
+C. Status flags (valid with out_valid, describe that triangle only)
+Signal				Meaning
+degenerate			D = 0 (zero area). zA = zB = zC = 0.
+orient_neg			D < 0 (clockwise in the D sign convention below).
+				Forced to 0 when degenerate.
+overflow_xy_range		A vertex x/y was outside the input contract and was
+				clamped to the viewport before any arithmetic.
+overflow_edge_c			An edge C did not fit in 34 bits (cannot happen for
+				in-contract inputs).
+overflow_zA / _zB / _zC		That depth coefficient saturated to the 32-bit range.
+overflow_depth			overflow_zA | overflow_zB | overflow_zC
+overflow			overflow_xy_range | overflow_edge_c | overflow_depth
+bbox_clamped			Floor/ceil of a bbox edge fell outside 0..299 / 0..399
+				and was clamped. Expected for triangles touching the
+				right/bottom border; not an error.
+
+
+5. MATHEMATICS
+All coordinates are Q24.8. Let dx1 = x1 - x0, dy1 = y1 - y0, dx2 = x2 - x0,
+dy2 = y2 - y0, dz1 = z1 - z0, dz2 = z2 - z0.
+
+5.1 Determinant (twice the signed area, Q.16)
+    D = dx1 * dy2 - dx2 * dy1
+    degenerate = (D == 0), orient_neg = (D < 0)
+
+5.2 Edge equations, directed edges i -> j = (0->1), (1->2), (2->0)
+    A = y_i - y_j            (Q24.8)
+    B = x_j - x_i            (Q24.8)
+    C = x_i * y_j - x_j * y_i (Q18.16)
+Exact integer arithmetic; no rounding. For D > 0 every point inside the
+triangle has E_i >= 0 for all three edges; for D < 0 the signs are
+reversed. The edge signs are NOT flipped for D < 0: the Rasterizer must
+use orient_neg.
+
+5.3 Bounding box
+    xmin = floor(min x), xmax = ceil(max x), clamped to 0..299
+    ymin = floor(min y), ymax = ceil(max y), clamped to 0..399
+The box is conservative: it can include a column or row with no pixel
+centre inside the triangle.
+
+5.4 Depth plane
+    Nx = dz1 * dy2 - dz2 * dy1,  Ny = dx1 * dz2 - dx2 * dz1
+    zA = Nx / D,  zB = Ny / D    (rounded to Q24.8)
+    zC = z0 - zA * x0 - zB * y0
+zC is computed from the already rounded zA and zB, so all three
+coefficients describe the same represented plane.
+Rounding: round to nearest, ties to even. Saturation: if the exact value
+is outside the signed 32-bit range the output is 0x7FFFFFFF or 0x80000000
+and the matching overflow_z* flag is set.
+
+
+6. RECIPROCAL (NO DIVIDER)
+1/D is formed from a normalised mantissa:
+- |D| = m * 2^e with m in [1, 2); e = position of the leading one.
+- LUT address = the 10 bits after the leading one.
+- recip_lut_q1_17.mem holds 1/m at the centre of each of the 1024 bins,
+  Q1.17 (generated by triangle_setup/sim/gen_recip_lut.py).
+  Relative error about 2^-11.
+- RECIP_NR = 1: one Newton-Raphson step r1 = r0 * (2 - m * r0), with m as
+  Q1.24. Relative error about 2^-17. Two extra DSP48E1, four extra clocks.
+- Nx * (+/- r) is then shifted right by (e + 9) with guard/sticky bits
+  for the rounding in 5.4. sign(D) is applied to r, not to the product.
+
+Measured accuracy (4000 test triangles, depth error at the vertices of
+ordinary triangles): RECIP_NR = 1 max 1.2 depth units, median 0.07;
+RECIP_NR = 0 max 25.6 units, median 0.9. Exact division would give
+about 1 unit max (output rounding alone).
+
+
+7. PIPELINE
+15 register stages (+4 with RECIP_NR = 1). Each stage contains at most
+one multiplier, one shifter or one carry chain.
+
+Stage	Work
+S0	Capture inputs; clamp x/y to the viewport; range flag
+S1	Differences dx, dy, dz; edge A/B; min/max for the bbox
+S2	All products (DSP48E1); bbox floor/ceil and clamp
+S3	D, Nx, Ny and the three edge C values; edge-C overflow check
+S3M	|D| registered (39-bit negate)
+S4	Leading-one detect of |D|; normalise; LUT address
+S5	Reciprocal LUT read (RAMB18, registered)
+N1-N4	Newton-Raphson refinement (RECIP_NR = 1 only)
+S5S	sign(D) applied to the reciprocal, registered
+S6	Nx * r, Ny * r (DSP48E1)
+S6M	|Nx * r|, |Ny * r| registered
+S7	Variable right shift by (e + 9); guard and sticky bits
+S8	Overflow test, round, saturate -> zA, zB
+S9	zA * x0, zB * y0 (DSP48E1)
+S9M	zC numerator  z0 * 2^8 - zA * x0 - zB * y0  registered
+S10	zC round and saturate; output registers
+
+Stages S3M, S5S, S6M and S9M were added after timing analysis (section 10).
+The bbox, edge and colour data travel alongside the depth path so all
+outputs of one triangle appear together.
+
+
+8. HANDSHAKE, BACKPRESSURE AND RESET
+    in_ready = rst_n && (!out_valid || out_ready)
+- A triangle is accepted on a rising edge where in_valid && in_ready.
+- When out_valid = 1 and out_ready = 0, the whole pipeline (all stages and
+  the LUT output register) freezes and in_ready = 0. Nothing is dropped,
+  repeated or reordered.
+- Output is held stable while out_valid = 1 and out_ready = 0.
+- rst_n (asynchronous, active low) clears the valid bits and status flags
+  only. Data registers have no reset so Vivado can pack them into
+  DSP48E1/RAMB18 registers; they are qualified by valid. Drive rst_n from a
+  reset synchroniser (asynchronous assert, synchronous release).
+
+Pipeline-level connection to the Rasterizer (hardware_pipeline.v):
+    pipe.discard          = setup.degenerate || setup.overflow_depth
+    raster.triangle_valid = setup.out_valid && !pipe.discard
+    setup.out_ready       = raster.idle_raster || pipe.discard
+    raster.orient_neg     = setup.orient_neg
+A discarded triangle is consumed at once and never reaches the Rasterizer.
+
+
+9. RESOURCES (Vivado 2025.2, out-of-context, xc7a100tcsg324-1, RECIP_NR = 1)
+Resource		Used		Available	%
+Slice LUTs		2641		63400		4.2
+Slice registers		1880		126800		1.5
+DSP48E1			30		240		12.5
+RAMB18			1		270		0.4
+
+
+10. TIMING
+Out-of-context synthesis + implementation, 10 ns clock (100 MHz):
+- WNS = +1.068 ns, WHS = +0.046 ns, all constraints met (Fmax about 112 MHz)
+- Critical path: leading-one detect / normalise of |D| into the LUT
+  address (S4).
+History: the first implementation missed 100 MHz by 0.70 ns; three
+register splits (S3M, S6M + S9M, S5S) fixed it, each adding one or two
+clocks of latency with identical outputs.
+Re-run: individual_modules/triangle_setup/timing_check.tcl (see README).
+This checks the module alone; the full design must also be checked with
+the board XDC.
+
+
+11. VERIFICATION
+individual_modules/triangle_setup/sim/run.sh (Icarus Verilog + Python):
+- 4000 triangles: ordinary, small, viewport corners, collinear, slivers,
+  extreme z, out-of-contract x/y; random in_valid / out_ready stalls.
+- Edges, bbox and all flags checked against exact integer maths.
+- With RECIP_NR = 0 the output stream is bit-identical to the original
+  3-stage design (sha256 of the stream).
+- With RECIP_NR = 1 the vertex depth error must stay <= 2 units.
+Pipeline level: tb_pipeline_memfiles passes all 97 checks with this unit.
+
+
+12. NOTES
+1. The input clamp is a safety net: in-contract inputs are never changed.
+   Out-of-contract triangles are still processed (on the clamped values)
+   and flagged with overflow_xy_range.
+2. Integer pixel (px, py) corresponds to Q24.8 coordinate (px * 256, py * 256).
+   The Rasterizer evaluates E and z at pixel centres (px + 0.5, py + 0.5).
+3. Any change to the module must be copied to both RTL locations, and the
+   LUT file must stay next to the RTL (or RECIP_LUT_FILE set to its path).
+   If the LUT is missing, every reciprocal reads 0 and zA = zB = 0.
+========================================================================
