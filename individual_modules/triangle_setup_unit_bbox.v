@@ -325,7 +325,7 @@ module triangle_setup_unit_debug #(
 
         reg signed [18:0] whole_ceil;
         begin
-            whole_ceil = $signed(raw >>> 8) + (|raw[7:0]);
+            whole_ceil = $signed(raw >>> 8) + $signed({1'b0, |raw[7:0]});
             if (whole_ceil < 0)       bbox_ceil_clamp_x = 10'd0;
             else if (whole_ceil > 299)bbox_ceil_clamp_x = 10'd299;
             else                     bbox_ceil_clamp_x = whole_ceil[9:0];
@@ -349,7 +349,7 @@ module triangle_setup_unit_debug #(
 
         reg signed [18:0] whole_ceil;
         begin
-            whole_ceil = $signed(raw >>> 8) + (|raw[7:0]);
+            whole_ceil = $signed(raw >>> 8) + $signed({1'b0, |raw[7:0]});
             if (whole_ceil < 0)       bbox_ceil_clamp_y = 10'd0;
             else if (whole_ceil > 399)bbox_ceil_clamp_y = 10'd399;
             else                     bbox_ceil_clamp_y = whole_ceil[9:0];
@@ -366,7 +366,7 @@ module triangle_setup_unit_debug #(
         reg signed [18:0] lo, hi;
         begin
             lo = min_raw >>> 8;
-            hi = $signed(max_raw >>> 8) + (|max_raw[7:0]);
+            hi = $signed(max_raw >>> 8) + $signed({1'b0, |max_raw[7:0]});
             bbox_clamp_needed_x = (lo < 0) || (lo > 299) || (hi < 0) || (hi > 299);
         end
     endfunction
@@ -378,7 +378,7 @@ module triangle_setup_unit_debug #(
         reg signed [18:0] lo, hi;
         begin
             lo = min_raw >>> 8;
-            hi = $signed(max_raw >>> 8) + (|max_raw[7:0]);
+            hi = $signed(max_raw >>> 8) + $signed({1'b0, |max_raw[7:0]});
             bbox_clamp_needed_y = (lo < 0) || (lo > 399) || (hi < 0) || (hi > 399);
         end
     endfunction
