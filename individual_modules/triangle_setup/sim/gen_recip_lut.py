@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Generate recip_lut_q1_17.mem for triangle_setup_unit.
+"""Generate recip_lut_q1_17.mem for the triangle setup unit.
 
-Address = the 10 fraction bits that follow the leading one of |D|
-(d_normalized[37:28]), so each entry covers m in [1 + a/1024, 1 + (a+1)/1024).
-Each entry stores round(2^17 / m_mid) with m_mid the CENTRE of that bin, which
-halves the worst-case error versus using the bin start (max rel. error ~2^-11).
-Values are in (0.5, 1.0] -> Q1.17, 18 bits, one hex word per line.
+Address a = the 10 fraction bits after the leading one of |D|, so the bin
+covers m in [1 + a/1024, 1 + (a+1)/1024). Entry a = round(2^17 / (1 + a/1024)),
+i.e. 1/m at the START of the bin, as Q1.17 (18 bits). Matches the LUT used in
+hardware_pipeline/ and the formula in tb_hardware_pipeline.v (round half up).
+usage: gen_recip_lut.py [output.mem]
 """
+import math
 import sys
 
 ADDR_BITS = 10
@@ -14,16 +15,17 @@ FRAC_BITS = 17
 
 
 def entry(a: int) -> int:
-    m_mid = 1.0 + (a + 0.5) / (1 << ADDR_BITS)
-    v = int(round((1 << FRAC_BITS) / m_mid))
+    v = math.floor((1 << FRAC_BITS) / (1.0 + a / (1 << ADDR_BITS)) + 0.5)
     assert 0 < v < (1 << 18)
     return v
 
 
 def main(path: str = "recip_lut_q1_17.mem") -> None:
-    with open(path, "w") as f:
+    with open(path, "w", newline="\n") as f:
+        f.write("// recip_lut_q1_17.mem - 1024 x 18-bit, "
+                "entry a = round(2^17 / (1 + a/1024)), Q1.17\n")
         for a in range(1 << ADDR_BITS):
-            f.write(f"{entry(a):05x}\n")
+            f.write(f"{entry(a):05X}\n")
 
 
 if __name__ == "__main__":
