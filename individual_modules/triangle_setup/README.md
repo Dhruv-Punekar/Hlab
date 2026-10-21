@@ -16,8 +16,8 @@ the module changes.
 
 ## Key facts
 
-- 11-stage pipeline (15 with `RECIP_NR=1`, the default); one triangle per
-  clock. Latency is the `LATENCY` localparam: 10 cycles, or 14 with NR.
+- 15-stage pipeline (19 with `RECIP_NR=1`, the default); one triangle per
+  clock. Latency is the `LATENCY` localparam: 14 cycles, or 18 with NR.
 - Ready/valid on both sides; a stalled output freezes the whole pipeline.
 - `RECIP_NR=1` refines the LUT reciprocal with one Newton-Raphson step
   (worst depth error ~1.2 units instead of ~25). `RECIP_NR=0` gives the

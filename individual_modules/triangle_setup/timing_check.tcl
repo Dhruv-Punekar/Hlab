@@ -21,8 +21,16 @@ set f [open "$out/clk.xdc" w]
 puts $f "create_clock -name clk -period $period \[get_ports clk\]"
 close $f
 
+# The LUT file has gone missing after earlier runs. Keep its contents in
+# memory, give Vivado a copy inside $out, and put the original back at the
+# end if it disappeared.
+set mem_src "$here/recip_lut_q1_17.mem"
+set f [open $mem_src r]; fconfigure $f -translation binary
+set mem_data [read $f]; close $f
+file copy -force $mem_src "$out/recip_lut_q1_17.mem"
+
 read_verilog $rtl
-read_mem     "$here/recip_lut_q1_17.mem"
+read_mem     "$out/recip_lut_q1_17.mem"
 read_xdc     "$out/clk.xdc"
 
 # Out-of-context: the module's ~1000 ports are not mapped to package pins.
@@ -40,3 +48,9 @@ set wns [get_property SLACK [get_timing_paths -setup -max_paths 1]]
 set whs [get_property SLACK [get_timing_paths -hold  -max_paths 1]]
 puts "RESULT [file tail $rtl] @ ${period} ns on $part : WNS=$wns ns  WHS=$whs ns  Fmax~[format %.1f [expr {1000.0 / ($period - $wns)}]] MHz"
 puts "Reports: $out"
+
+if {![file exists $mem_src]} {
+    set f [open $mem_src w]; fconfigure $f -translation binary
+    puts -nonewline $f $mem_data; close $f
+    puts "WARNING: $mem_src was missing after the run and has been restored."
+}

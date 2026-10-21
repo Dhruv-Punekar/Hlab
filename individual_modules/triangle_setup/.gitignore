@@ -3,3 +3,6 @@ timing/
 vivado*.log
 vivado*.jou
 vivado_pid*.str
+clockInfo.txt
+dfx_runtime.txt
+vivado_*.backup.*

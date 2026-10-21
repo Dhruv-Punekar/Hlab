@@ -18,19 +18,21 @@
 //          multiply, a 3-input 51-bit add and a second round/saturate in ONE
 //          clock. On an Artix-7 (-1/-2) that path is several times longer than
 //          a 10 ns (100 MHz) period.
-//   rev B: 11 register stages (S0..S10), every stage holds at most one
+//   rev B: 15 register stages (S0..S10 + S3M, S5S, S6M, S9M), each holds at most one
 //          multiply OR one shifter OR one carry chain. II is still 1.
 //
 //   S0  capture + range clamp            S6  Nx*inv, Ny*inv (sign folded in inv)
-//   S1  differences, bbox min/max        S7  |p| >> (e+9), guard/sticky
-//   S2  all products (DSP48 MREG)        S8  overflow test, round, saturate zA/zB
-//   S3  D, Nx, Ny, edge C (DSP48 PREG)   S9  zA*x0, zB*y0
-//   S4  |D| leading-one normalize        S10 zC round/saturate -> output regs
-//   S5  reciprocal BRAM read (registered)
+//   S1  differences, bbox min/max        S6M |Nx*inv|, |Ny*inv| registered
+//   S2  all products (DSP48 MREG)        S7  |p| >> (e+9), guard/sticky
+//   S3  D, Nx, Ny, edge C (DSP48 PREG)   S8  overflow test, round, saturate zA/zB
+//   S3M |D| (negate) registered          S9  zA*x0, zB*y0
+//   S4  leading-one detect + normalize   S9M zC numerator sum registered
+//   S5  reciprocal BRAM read (registered) S10 zC round/saturate -> output regs
+//   S5S signed reciprocal registered (feeds the S6 DSPs)
 //   N1..N4 (RECIP_NR=1 only) Newton-Raphson refinement of 1/|D|
 //
 // Unstalled latency: input accepted on edge k -> out_valid after edge
-// k+10 (RECIP_NR=0) or k+14 (RECIP_NR=1). Use the LATENCY localparam.
+// k+14 (RECIP_NR=0) or k+18 (RECIP_NR=1). Use the LATENCY localparam.
 // Backpressure: global stall (all stages + BRAM CE freeze together).
 //
 // Reset: rst_n is asynchronous active-low as before, but ONLY valid bits and
@@ -91,7 +93,7 @@ module triangle_setup_unit_debug #(
 );
 
     localparam integer NR_ST     = RECIP_NR ? 4 : 0;
-    localparam integer LATENCY   = 10 + NR_ST;    // edges from accept to out_valid
+    localparam integer LATENCY   = 14 + NR_ST;    // edges from accept to out_valid
     localparam signed [31:0] X_MAX_Q8 = 32'sd76800;   // 300.0 in Q24.8
     localparam signed [31:0] Y_MAX_Q8 = 32'sd102400;  // 400.0 in Q24.8
     localparam integer X_PIX_MAX = 299;
@@ -338,18 +340,54 @@ module triangle_setup_unit_debug #(
     end
 
     // =========================================================================
-    // S4: |D| leading-one detect and normalize -> ROM address
+    // S3M: |D| (39-bit negate) registered on its own. Doing the negate, the
+    // leading-one detect and the normalize shift in one cycle before the
+    // BRAM address pin failed 100 MHz on xc7a100t-1 (WNS -0.70 ns).
     // =========================================================================
-    reg [38:0] s3_dmag;
-    reg [5:0]  s3_dexp;
-    reg [38:0] s3_dnorm;
+    reg        [38:0] m_dmag;
+    reg               m_dneg, m_degen;
+    reg signed [52:0] m_nx, m_ny;
+    reg signed [33:0] m_e0c, m_e1c, m_e2c;
+    reg               m_edge_c_ov;
+    reg signed [17:0] m_e0a, m_e0b, m_e1a, m_e1b, m_e2a, m_e2b;
+    reg        [9:0]  m_bxmin, m_bxmax, m_bymin, m_bymax;
+    reg               m_bbox_clamped;
+    reg signed [17:0] m_x0, m_y0;
+    reg signed [31:0] m_z0;
+    reg        [15:0] m_color;
+    reg               m_xy_bad;
+
+    always @(posedge clk) begin
+        if (pipe_advance) begin
+            m_dmag  <= s3_d[38] ? (~s3_d + 39'd1) : s3_d;
+            m_dneg  <= s3_d[38];
+            m_degen <= (s3_d == 39'sd0);
+            m_nx <= s3_nx;  m_ny <= s3_ny;
+            m_e0c <= s3_e0c; m_e1c <= s3_e1c; m_e2c <= s3_e2c;
+            m_edge_c_ov <= s3_edge_c_ov;
+            m_e0a <= s3_e0a; m_e0b <= s3_e0b;
+            m_e1a <= s3_e1a; m_e1b <= s3_e1b;
+            m_e2a <= s3_e2a; m_e2b <= s3_e2b;
+            m_bxmin <= s3_bxmin; m_bxmax <= s3_bxmax;
+            m_bymin <= s3_bymin; m_bymax <= s3_bymax;
+            m_bbox_clamped <= s3_bbox_clamped;
+            m_x0 <= s3_x0; m_y0 <= s3_y0; m_z0 <= s3_z0;
+            m_color  <= s3_color;
+            m_xy_bad <= s3_xy_bad;
+        end
+    end
+
+    // =========================================================================
+    // S4: leading-one detect and normalize |D| -> ROM address
+    // =========================================================================
+    reg [5:0]  m_dexp;
+    reg [38:0] m_dnorm;
     integer    nb;
     always @* begin
-        s3_dmag = s3_d[38] ? (~s3_d + 39'd1) : s3_d;
-        s3_dexp = 6'd0;
+        m_dexp = 6'd0;
         for (nb = 0; nb < 39; nb = nb + 1)
-            if (s3_dmag[nb]) s3_dexp = nb[5:0];
-        s3_dnorm = s3_dmag << (6'd38 - s3_dexp);
+            if (m_dmag[nb]) m_dexp = nb[5:0];
+        m_dnorm = m_dmag << (6'd38 - m_dexp);
     end
 
     reg [9:0]         s4_addr;
@@ -369,23 +407,23 @@ module triangle_setup_unit_debug #(
 
     always @(posedge clk) begin
         if (pipe_advance) begin
-            s4_addr  <= s3_dnorm[37:28];
-            s4_mant  <= s3_dnorm[38:14];
-            s4_shift <= {1'b0, s3_dexp} + 7'd9;
-            s4_dneg  <= s3_d[38];
-            s4_degen <= (s3_d == 39'sd0);
-            s4_nx <= s3_nx;  s4_ny <= s3_ny;
-            s4_e0c <= s3_e0c; s4_e1c <= s3_e1c; s4_e2c <= s3_e2c;
-            s4_edge_c_ov <= s3_edge_c_ov;
-            s4_e0a <= s3_e0a; s4_e0b <= s3_e0b;
-            s4_e1a <= s3_e1a; s4_e1b <= s3_e1b;
-            s4_e2a <= s3_e2a; s4_e2b <= s3_e2b;
-            s4_bxmin <= s3_bxmin; s4_bxmax <= s3_bxmax;
-            s4_bymin <= s3_bymin; s4_bymax <= s3_bymax;
-            s4_bbox_clamped <= s3_bbox_clamped;
-            s4_x0 <= s3_x0; s4_y0 <= s3_y0; s4_z0 <= s3_z0;
-            s4_color  <= s3_color;
-            s4_xy_bad <= s3_xy_bad;
+            s4_addr  <= m_dnorm[37:28];
+            s4_mant  <= m_dnorm[38:14];
+            s4_shift <= {1'b0, m_dexp} + 7'd9;
+            s4_dneg  <= m_dneg;
+            s4_degen <= m_degen;
+            s4_nx <= m_nx;  s4_ny <= m_ny;
+            s4_e0c <= m_e0c; s4_e1c <= m_e1c; s4_e2c <= m_e2c;
+            s4_edge_c_ov <= m_edge_c_ov;
+            s4_e0a <= m_e0a; s4_e0b <= m_e0b;
+            s4_e1a <= m_e1a; s4_e1b <= m_e1b;
+            s4_e2a <= m_e2a; s4_e2b <= m_e2b;
+            s4_bxmin <= m_bxmin; s4_bxmax <= m_bxmax;
+            s4_bymin <= m_bymin; s4_bymax <= m_bymax;
+            s4_bbox_clamped <= m_bbox_clamped;
+            s4_x0 <= m_x0; s4_y0 <= m_y0; s4_z0 <= m_z0;
+            s4_color  <= m_color;
+            s4_xy_bad <= m_xy_bad;
         end
     end
 
@@ -476,6 +514,20 @@ module triangle_setup_unit_debug #(
         end
     endgenerate
 
+    // S5S: apply sign(D) to the reciprocal and register it, so the zA/zB
+    // multipliers see a registered operand (DSP48E1 AREG/BREG). With the
+    // 19-bit negate in front of the DSP the path missed 100 MHz by 0.06 ns.
+    // dneg is bit PW-8 of the payload ({shift[6:0], dneg, ...}).
+    reg [PW-1:0]       q_pay;
+    reg signed [18:0]  q_inv_s;
+    always @(posedge clk) begin
+        if (pipe_advance) begin
+            q_pay   <= n_pay;
+            q_inv_s <= n_pay[PW-8] ? -$signed({1'b0, n_inv})
+                                   :  $signed({1'b0, n_inv});
+        end
+    end
+
     wire [6:0]         n_shift;
     wire               n_dneg, n_degen, n_edge_c_ov, n_bbox_clamped, n_xy_bad;
     wire signed [52:0] n_nx, n_ny;
@@ -488,15 +540,14 @@ module triangle_setup_unit_debug #(
             n_e0c, n_e1c, n_e2c, n_edge_c_ov,
             n_e0a, n_e0b, n_e1a, n_e1b, n_e2a, n_e2b,
             n_bxmin, n_bxmax, n_bymin, n_bymax, n_bbox_clamped,
-            n_x0, n_y0, n_z0, n_color, n_xy_bad} = n_pay;
+            n_x0, n_y0, n_z0, n_color, n_xy_bad} = q_pay;
 
     // =========================================================================
     // S6: N * (+/-inv_m). Folding sign(D) into the 19-bit multiplier operand
     // replaces rev A's 80-bit post-multiply negation; result is identical
     // because Nx*(-inv) == -(Nx*inv) exactly.
     // =========================================================================
-    wire signed [18:0] n_inv_s = n_dneg ? -$signed({1'b0, n_inv})
-                                          :  $signed({1'b0, n_inv});
+    wire signed [18:0] n_inv_s = q_inv_s;
 
     reg signed [71:0] s6_pa, s6_pb;
     reg [6:0]         s6_shift;
@@ -531,6 +582,66 @@ module triangle_setup_unit_debug #(
     end
 
     // =========================================================================
+    // S6M: |Nx*inv|, |Ny*inv| registered before the 72-bit variable shift
+    // (negate + shift in one cycle failed 100 MHz on xc7a100t-1).
+    // =========================================================================
+    reg [71:0] s6m_maga, s6m_magb;
+    reg        s6m_nega, s6m_negb;
+    reg [6:0]          s6m_shift;
+    reg                s6m_dneg;
+    reg                s6m_degen;
+    reg signed [33:0]  s6m_e0c;
+    reg signed [33:0]  s6m_e1c;
+    reg signed [33:0]  s6m_e2c;
+    reg                s6m_edge_c_ov;
+    reg signed [17:0]  s6m_e0a;
+    reg signed [17:0]  s6m_e0b;
+    reg signed [17:0]  s6m_e1a;
+    reg signed [17:0]  s6m_e1b;
+    reg signed [17:0]  s6m_e2a;
+    reg signed [17:0]  s6m_e2b;
+    reg [9:0]          s6m_bxmin;
+    reg [9:0]          s6m_bxmax;
+    reg [9:0]          s6m_bymin;
+    reg [9:0]          s6m_bymax;
+    reg                s6m_bbox_clamped;
+    reg signed [17:0]  s6m_x0;
+    reg signed [17:0]  s6m_y0;
+    reg signed [31:0]  s6m_z0;
+    reg [15:0]         s6m_color;
+    reg                s6m_xy_bad;
+
+    always @(posedge clk) begin
+        if (pipe_advance) begin
+            s6m_maga <= s6_pa[71] ? -s6_pa : s6_pa;  s6m_nega <= s6_pa[71];
+            s6m_magb <= s6_pb[71] ? -s6_pb : s6_pb;  s6m_negb <= s6_pb[71];
+            s6m_shift <= s6_shift;
+            s6m_dneg <= s6_dneg;
+            s6m_degen <= s6_degen;
+            s6m_e0c <= s6_e0c;
+            s6m_e1c <= s6_e1c;
+            s6m_e2c <= s6_e2c;
+            s6m_edge_c_ov <= s6_edge_c_ov;
+            s6m_e0a <= s6_e0a;
+            s6m_e0b <= s6_e0b;
+            s6m_e1a <= s6_e1a;
+            s6m_e1b <= s6_e1b;
+            s6m_e2a <= s6_e2a;
+            s6m_e2b <= s6_e2b;
+            s6m_bxmin <= s6_bxmin;
+            s6m_bxmax <= s6_bxmax;
+            s6m_bymin <= s6_bymin;
+            s6m_bymax <= s6_bymax;
+            s6m_bbox_clamped <= s6_bbox_clamped;
+            s6m_x0 <= s6_x0;
+            s6m_y0 <= s6_y0;
+            s6m_z0 <= s6_z0;
+            s6m_color <= s6_color;
+            s6m_xy_bad <= s6_xy_bad;
+        end
+    end
+
+    // =========================================================================
     // S7: magnitude and variable right shift; keep guard/sticky for rounding.
     // =========================================================================
     // Split form of rev A depth_round_saturate():
@@ -553,10 +664,8 @@ module triangle_setup_unit_debug #(
         end
     endfunction
 
-    wire [71:0] s6_maga = s6_pa[71] ? -s6_pa : s6_pa;
-    wire [71:0] s6_magb = s6_pb[71] ? -s6_pb : s6_pb;
-    wire [35:0] s6_sa   = shr_split(s6_maga, s6_shift);
-    wire [35:0] s6_sb   = shr_split(s6_magb, s6_shift);
+    wire [35:0] s6_sa   = shr_split(s6m_maga, s6m_shift);
+    wire [35:0] s6_sb   = shr_split(s6m_magb, s6m_shift);
 
     reg [35:0]        s7_sa, s7_sb;
     reg               s7_nega, s7_negb;
@@ -573,20 +682,20 @@ module triangle_setup_unit_debug #(
 
     always @(posedge clk) begin
         if (pipe_advance) begin
-            s7_sa <= s6_sa;  s7_nega <= s6_pa[71];
-            s7_sb <= s6_sb;  s7_negb <= s6_pb[71];
-            s7_dneg <= s6_dneg; s7_degen <= s6_degen;
-            s7_e0c <= s6_e0c; s7_e1c <= s6_e1c; s7_e2c <= s6_e2c;
-            s7_edge_c_ov <= s6_edge_c_ov;
-            s7_e0a <= s6_e0a; s7_e0b <= s6_e0b;
-            s7_e1a <= s6_e1a; s7_e1b <= s6_e1b;
-            s7_e2a <= s6_e2a; s7_e2b <= s6_e2b;
-            s7_bxmin <= s6_bxmin; s7_bxmax <= s6_bxmax;
-            s7_bymin <= s6_bymin; s7_bymax <= s6_bymax;
-            s7_bbox_clamped <= s6_bbox_clamped;
-            s7_x0 <= s6_x0; s7_y0 <= s6_y0; s7_z0 <= s6_z0;
-            s7_color  <= s6_color;
-            s7_xy_bad <= s6_xy_bad;
+            s7_sa <= s6_sa;  s7_nega <= s6m_nega;
+            s7_sb <= s6_sb;  s7_negb <= s6m_negb;
+            s7_dneg <= s6m_dneg; s7_degen <= s6m_degen;
+            s7_e0c <= s6m_e0c; s7_e1c <= s6m_e1c; s7_e2c <= s6m_e2c;
+            s7_edge_c_ov <= s6m_edge_c_ov;
+            s7_e0a <= s6m_e0a; s7_e0b <= s6m_e0b;
+            s7_e1a <= s6m_e1a; s7_e1b <= s6m_e1b;
+            s7_e2a <= s6m_e2a; s7_e2b <= s6m_e2b;
+            s7_bxmin <= s6m_bxmin; s7_bxmax <= s6m_bxmax;
+            s7_bymin <= s6m_bymin; s7_bymax <= s6m_bymax;
+            s7_bbox_clamped <= s6m_bbox_clamped;
+            s7_x0 <= s6m_x0; s7_y0 <= s6m_y0; s7_z0 <= s6m_z0;
+            s7_color  <= s6m_color;
+            s7_xy_bad <= s6m_xy_bad;
         end
     end
 
@@ -686,26 +795,85 @@ module triangle_setup_unit_debug #(
     end
 
     // =========================================================================
+    // S9M: zC numerator z0<<8 - zA*x0 - zB*y0 registered before round/sat
+    // (sum + abs + round + negate in one cycle failed 100 MHz).
+    // =========================================================================
+    reg signed [50:0] s9m_zc_q16;
+    reg signed [31:0]  s9m_za;
+    reg signed [31:0]  s9m_zb;
+    reg                s9m_ova;
+    reg                s9m_ovb;
+    reg                s9m_dneg;
+    reg                s9m_degen;
+    reg signed [33:0]  s9m_e0c;
+    reg signed [33:0]  s9m_e1c;
+    reg signed [33:0]  s9m_e2c;
+    reg                s9m_edge_c_ov;
+    reg signed [17:0]  s9m_e0a;
+    reg signed [17:0]  s9m_e0b;
+    reg signed [17:0]  s9m_e1a;
+    reg signed [17:0]  s9m_e1b;
+    reg signed [17:0]  s9m_e2a;
+    reg signed [17:0]  s9m_e2b;
+    reg [9:0]          s9m_bxmin;
+    reg [9:0]          s9m_bxmax;
+    reg [9:0]          s9m_bymin;
+    reg [9:0]          s9m_bymax;
+    reg                s9m_bbox_clamped;
+    reg signed [31:0]  s9m_z0;
+    reg [15:0]         s9m_color;
+    reg                s9m_xy_bad;
+
+    always @(posedge clk) begin
+        if (pipe_advance) begin
+            s9m_zc_q16 <= ($signed(s9_z0) <<< 8) - s9_pax - s9_pby;
+            s9m_za <= s9_za;
+            s9m_zb <= s9_zb;
+            s9m_ova <= s9_ova;
+            s9m_ovb <= s9_ovb;
+            s9m_dneg <= s9_dneg;
+            s9m_degen <= s9_degen;
+            s9m_e0c <= s9_e0c;
+            s9m_e1c <= s9_e1c;
+            s9m_e2c <= s9_e2c;
+            s9m_edge_c_ov <= s9_edge_c_ov;
+            s9m_e0a <= s9_e0a;
+            s9m_e0b <= s9_e0b;
+            s9m_e1a <= s9_e1a;
+            s9m_e1b <= s9_e1b;
+            s9m_e2a <= s9_e2a;
+            s9m_e2b <= s9_e2b;
+            s9m_bxmin <= s9_bxmin;
+            s9m_bxmax <= s9_bxmax;
+            s9m_bymin <= s9_bymin;
+            s9m_bymax <= s9_bymax;
+            s9m_bbox_clamped <= s9_bbox_clamped;
+            s9m_z0 <= s9_z0;
+            s9m_color <= s9_color;
+            s9m_xy_bad <= s9_xy_bad;
+        end
+    end
+
+    // =========================================================================
     // S10: zC = round_sat((z0<<8 - zA*x0 - zB*y0) >> 8), output registers
     // =========================================================================
-    wire signed [50:0] s9_zc_q16 = ($signed(s9_z0) <<< 8) - s9_pax - s9_pby;
-    wire        [50:0] s9_zc_mag = s9_zc_q16[50] ? -s9_zc_q16 : s9_zc_q16;
+    wire        [50:0] s9_zc_mag = s9m_zc_q16[50] ? -s9m_zc_q16 : s9m_zc_q16;
     wire        [42:0] s9_zc_q   = s9_zc_mag[50:8];
     wire [35:0] s9_zc_sp = { |s9_zc_q[42:32], s9_zc_mag[7], |s9_zc_mag[6:0],
                              s9_zc_q[31:0], 1'b0 };
-    wire [32:0] s9_zc = s9_degen ? 33'd0 : round_sat(s9_zc_sp, s9_zc_q16[50]);
+    wire [32:0] s9m_zc = s9m_degen ? 33'd0 : round_sat(s9_zc_sp, s9m_zc_q16[50]);
 
     always @(posedge clk) begin
         if (pipe_advance && v[LATENCY-1]) begin
-            bbox_xmin <= s9_bxmin;  bbox_xmax <= s9_bxmax;
-            bbox_ymin <= s9_bymin;  bbox_ymax <= s9_bymax;
-            edge0_A <= s9_e0a; edge0_B <= s9_e0b; edge0_C <= s9_e0c;
-            edge1_A <= s9_e1a; edge1_B <= s9_e1b; edge1_C <= s9_e1c;
-            edge2_A <= s9_e2a; edge2_B <= s9_e2b; edge2_C <= s9_e2c;
-            zA <= s9_za;
-            zB <= s9_zb;
-            zC <= s9_zc[31:0];
-            face_color <= s9_color;
+            bbox_xmin <= s9m_bxmin;  bbox_xmax <= s9m_bxmax;
+            bbox_ymin <= s9m_bymin;  bbox_ymax <= s9m_bymax;
+            edge0_A <= s9m_e0a; edge0_B <= s9m_e0b; edge0_C <= s9m_e0c;
+            edge1_A <= s9m_e1a; edge1_B <= s9m_e1b; edge1_C <= s9m_e1c;
+            edge2_A <= s9m_e2a; edge2_B <= s9m_e2b; edge2_C <= s9m_e2c;
+            zA <= s9m_za;
+            zB <= s9m_zb;
+            zC <= s9m_zc[31:0];
+            face_color <= s9m_color;
         end
     end
 
@@ -722,17 +890,17 @@ module triangle_setup_unit_debug #(
             orient_neg        <= 1'b0;
             degenerate        <= 1'b0;
         end else if (pipe_advance && v[LATENCY-1]) begin
-            overflow_xy_range <= s9_xy_bad;
-            overflow_edge_c   <= s9_edge_c_ov;
-            overflow_zA       <= s9_ova;
-            overflow_zB       <= s9_ovb;
-            overflow_zC       <= s9_zc[32];
-            overflow_depth    <= s9_ova | s9_ovb | s9_zc[32];
-            overflow          <= s9_xy_bad | s9_edge_c_ov |
-                                 s9_ova | s9_ovb | s9_zc[32];
-            bbox_clamped      <= s9_bbox_clamped;
-            orient_neg        <= s9_dneg && !s9_degen;
-            degenerate        <= s9_degen;
+            overflow_xy_range <= s9m_xy_bad;
+            overflow_edge_c   <= s9m_edge_c_ov;
+            overflow_zA       <= s9m_ova;
+            overflow_zB       <= s9m_ovb;
+            overflow_zC       <= s9m_zc[32];
+            overflow_depth    <= s9m_ova | s9m_ovb | s9m_zc[32];
+            overflow          <= s9m_xy_bad | s9m_edge_c_ov |
+                                 s9m_ova | s9m_ovb | s9m_zc[32];
+            bbox_clamped      <= s9m_bbox_clamped;
+            orient_neg        <= s9m_dneg && !s9m_degen;
+            degenerate        <= s9m_degen;
         end
     end
 
