@@ -18,7 +18,7 @@
 //          multiply, a 3-input 51-bit add and a second round/saturate in ONE
 //          clock. On an Artix-7 (-1/-2) that path is several times longer than
 //          a 10 ns (100 MHz) period.
-//   rev B: 14 register stages (S0..S10 + S3M, S6M, S9M), each holds at most one
+//   rev B: 15 register stages (S0..S10 + S3M, S5S, S6M, S9M), each holds at most one
 //          multiply OR one shifter OR one carry chain. II is still 1.
 //
 //   S0  capture + range clamp            S6  Nx*inv, Ny*inv (sign folded in inv)
@@ -28,10 +28,11 @@
 //   S3M |D| (negate) registered          S9  zA*x0, zB*y0
 //   S4  leading-one detect + normalize   S9M zC numerator sum registered
 //   S5  reciprocal BRAM read (registered) S10 zC round/saturate -> output regs
+//   S5S signed reciprocal registered (feeds the S6 DSPs)
 //   N1..N4 (RECIP_NR=1 only) Newton-Raphson refinement of 1/|D|
 //
 // Unstalled latency: input accepted on edge k -> out_valid after edge
-// k+13 (RECIP_NR=0) or k+17 (RECIP_NR=1). Use the LATENCY localparam.
+// k+14 (RECIP_NR=0) or k+18 (RECIP_NR=1). Use the LATENCY localparam.
 // Backpressure: global stall (all stages + BRAM CE freeze together).
 //
 // Reset: rst_n is asynchronous active-low as before, but ONLY valid bits and
@@ -92,7 +93,7 @@ module triangle_setup_unit_debug #(
 );
 
     localparam integer NR_ST     = RECIP_NR ? 4 : 0;
-    localparam integer LATENCY   = 13 + NR_ST;    // edges from accept to out_valid
+    localparam integer LATENCY   = 14 + NR_ST;    // edges from accept to out_valid
     localparam signed [31:0] X_MAX_Q8 = 32'sd76800;   // 300.0 in Q24.8
     localparam signed [31:0] Y_MAX_Q8 = 32'sd102400;  // 400.0 in Q24.8
     localparam integer X_PIX_MAX = 299;
@@ -513,6 +514,20 @@ module triangle_setup_unit_debug #(
         end
     endgenerate
 
+    // S5S: apply sign(D) to the reciprocal and register it, so the zA/zB
+    // multipliers see a registered operand (DSP48E1 AREG/BREG). With the
+    // 19-bit negate in front of the DSP the path missed 100 MHz by 0.06 ns.
+    // dneg is bit PW-8 of the payload ({shift[6:0], dneg, ...}).
+    reg [PW-1:0]       q_pay;
+    reg signed [18:0]  q_inv_s;
+    always @(posedge clk) begin
+        if (pipe_advance) begin
+            q_pay   <= n_pay;
+            q_inv_s <= n_pay[PW-8] ? -$signed({1'b0, n_inv})
+                                   :  $signed({1'b0, n_inv});
+        end
+    end
+
     wire [6:0]         n_shift;
     wire               n_dneg, n_degen, n_edge_c_ov, n_bbox_clamped, n_xy_bad;
     wire signed [52:0] n_nx, n_ny;
@@ -525,15 +540,14 @@ module triangle_setup_unit_debug #(
             n_e0c, n_e1c, n_e2c, n_edge_c_ov,
             n_e0a, n_e0b, n_e1a, n_e1b, n_e2a, n_e2b,
             n_bxmin, n_bxmax, n_bymin, n_bymax, n_bbox_clamped,
-            n_x0, n_y0, n_z0, n_color, n_xy_bad} = n_pay;
+            n_x0, n_y0, n_z0, n_color, n_xy_bad} = q_pay;
 
     // =========================================================================
     // S6: N * (+/-inv_m). Folding sign(D) into the 19-bit multiplier operand
     // replaces rev A's 80-bit post-multiply negation; result is identical
     // because Nx*(-inv) == -(Nx*inv) exactly.
     // =========================================================================
-    wire signed [18:0] n_inv_s = n_dneg ? -$signed({1'b0, n_inv})
-                                          :  $signed({1'b0, n_inv});
+    wire signed [18:0] n_inv_s = q_inv_s;
 
     reg signed [71:0] s6_pa, s6_pb;
     reg [6:0]         s6_shift;
