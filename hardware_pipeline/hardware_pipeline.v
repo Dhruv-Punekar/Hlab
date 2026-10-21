@@ -222,7 +222,7 @@ module hardware_pipeline #(
 
     // ------------------------------------------------------------------------
     // Setup -> Rasterizer handshake (pipeline-level connection)
-    //   pipe.discard          = setup.degenerate || setup.overflow
+    //   pipe.discard          = setup.degenerate || setup.overflow_depth
     //   raster.triangle_valid = setup.out_valid && !pipe.discard
     //   setup.out_ready       = raster.idle_raster || pipe.discard
     //   raster.orient_neg     = setup.orient_neg
@@ -231,7 +231,7 @@ module hardware_pipeline #(
     // ------------------------------------------------------------------------
     wire rast_idle, rast_done;
 
-    wire pipe_discard   = ts_degenerate || ts_overflow;
+    wire pipe_discard   = ts_degenerate || ts_ov_depth;
     wire rast_tri_valid = ts_out_valid && !pipe_discard;
     assign ts_out_ready = rast_idle || pipe_discard;
 
