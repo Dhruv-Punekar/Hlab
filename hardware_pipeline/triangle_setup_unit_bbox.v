@@ -1,50 +1,25 @@
 // -----------------------------------------------------------------------------
-// Triangle Setup Unit — debug/diagnostic variant  (rev B: Artix-7 timing fix)
+// Triangle Setup Unit — debug/diagnostic variant
 //
 // Converts one post-clipping, screen-space triangle into a rasterizer payload:
 //   * inclusive integer pixel bounding box (10-bit unsigned indices)
-//   * three signed edge equations  E(x,y) = A*x + B*y + C
+//   * three signed edge equations
 //   * Q24.8 depth plane z(x,y) = zA*x + zB*y + zC
 //   * shared RGB565 color and status flags
 //
-// With RECIP_NR=0 the outputs are BIT-IDENTICAL to rev A (same LUT, same
-// rounding/saturation, same flags; verified on 4000 random + corner-case
-// triangles under random backpressure). RECIP_NR=1 (default) adds one
-// Newton-Raphson step to the reciprocal; everything else is unchanged.
-// What changed is the micro-architecture:
+// Architecture: input capture (R0), parallel first calculations (R1), bounds
+// and synchronous reciprocal LUT (R2), final depth conversion/output (R3).
+// Unstalled input-to-output latency is three clock intervals; II = 1.
+// Backpressure freezes every stage and the LUT output register together.
 //
-//   rev A: 4 register stages; the last stage chained a 53x18 multiply, an
-//          80-bit negate, an 80-bit variable shifter, round/saturate, a 32x18
-//          multiply, a 3-input 51-bit add and a second round/saturate in ONE
-//          clock. On an Artix-7 (-1/-2) that path is several times longer than
-//          a 10 ns (100 MHz) period.
-//   rev B: 11 register stages (S0..S10), every stage holds at most one
-//          multiply OR one shifter OR one carry chain. II is still 1.
-//
-//   S0  capture + range clamp            S6  Nx*inv, Ny*inv (sign folded in inv)
-//   S1  differences, bbox min/max        S7  |p| >> (e+9), guard/sticky
-//   S2  all products (DSP48 MREG)        S8  overflow test, round, saturate zA/zB
-//   S3  D, Nx, Ny, edge C (DSP48 PREG)   S9  zA*x0, zB*y0
-//   S4  |D| leading-one normalize        S10 zC round/saturate -> output regs
-//   S5  reciprocal BRAM read (registered)
-//   N1..N4 (RECIP_NR=1 only) Newton-Raphson refinement of 1/|D|
-//
-// Unstalled latency: input accepted on edge k -> out_valid after edge
-// k+10 (RECIP_NR=0) or k+14 (RECIP_NR=1). Use the LATENCY localparam.
-// Backpressure: global stall (all stages + BRAM CE freeze together).
-//
-// Reset: rst_n is asynchronous active-low as before, but ONLY valid bits and
-// status flags use it. Datapath registers have no reset so Vivado can pack
-// them into DSP48E1 A/B/M/P registers and the RAMB18 output register (Xilinx
-// primitives only support synchronous reset). Drive rst_n from a reset
-// synchronizer (async assert, sync de-assert) at the top level.
+// This is a separate diagnostic variant of triangle_setup_unit. The original
+// module is unchanged. Detailed per-result flags identify input range,
+// edge-C narrowing, and individual depth-output overflow cases.
+// Numeric/interface contract is documented in triangle_setup_module_spec.txt.
+// x/y range is guaranteed by the upstream screen-space clipping contract.
 // -----------------------------------------------------------------------------
 module triangle_setup_unit_debug #(
-    parameter RECIP_LUT_FILE = "recip_lut_q1_17.mem",
-    // 1: one Newton-Raphson step refines the 10-bit LUT seed (rel. error
-    //    ~2^-11 -> ~2^-17), +4 cycles latency, +2 DSP48E1.
-    // 0: rev-A numerics exactly (LUT seed used directly).
-    parameter RECIP_NR       = 1
+    parameter RECIP_LUT_FILE = "recip_lut_q1_17.mem"
 ) (
     input wire                     clk,
     input wire                     rst_n,          // asynchronous active-low
@@ -90,649 +65,539 @@ module triangle_setup_unit_debug #(
     output reg                     degenerate
 );
 
-    localparam integer NR_ST     = RECIP_NR ? 4 : 0;
-    localparam integer LATENCY   = 10 + NR_ST;    // edges from accept to out_valid
-    localparam signed [31:0] X_MAX_Q8 = 32'sd76800;   // 300.0 in Q24.8
-    localparam signed [31:0] Y_MAX_Q8 = 32'sd102400;  // 400.0 in Q24.8
-    localparam integer X_PIX_MAX = 299;
-    localparam integer Y_PIX_MAX = 399;
-
     // -------------------------------------------------------------------------
     // Global advance / backpressure
     // -------------------------------------------------------------------------
-    // NOTE: in_ready is combinational from out_ready (same as rev A). If the
-    // upstream/downstream ready path fails timing at system level, put a 2-entry
-    // skid buffer on the output and drive pipe_advance from its "not full".
-    wire pipe_advance = rst_n && (!out_valid || out_ready);
-    assign in_ready   = pipe_advance;
+    // A blocked output freezes the complete pipeline. When the output is empty
+    // or accepted this cycle, all stages may advance and a new input may enter.
+    wire pipe_advance;
+    assign pipe_advance = rst_n && (!out_valid || out_ready);
+    assign in_ready     = pipe_advance;
 
-    // Valid chain: v[i] is the valid bit of stage Si.
-    reg [LATENCY:0] v;
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)            v <= {(LATENCY+1){1'b0}};
-        else if (pipe_advance) v <= {v[LATENCY-1:0], in_valid};
-    end
-    assign out_valid = v[LATENCY];
+    // -------------------------------------------------------------------------
+    // Stage R0: capture and coordinate range reduction
+    // -------------------------------------------------------------------------
+    reg                r0_valid;
+    reg signed [17:0]  r0_x0, r0_y0, r0_x1, r0_y1, r0_x2, r0_y2;
+    reg signed [31:0]  r0_z0, r0_z1, r0_z2;
+    reg        [15:0]  r0_color;
+    reg                r0_xy_range_bad;
 
-    // =========================================================================
-    // S0: capture and coordinate range clamp (diagnostic only)
-    // =========================================================================
-    wire input_xy_range_bad =
-        (in_x0 < 0) || (in_x0 > X_MAX_Q8) ||
-        (in_x1 < 0) || (in_x1 > X_MAX_Q8) ||
-        (in_x2 < 0) || (in_x2 > X_MAX_Q8) ||
-        (in_y0 < 0) || (in_y0 > Y_MAX_Q8) ||
-        (in_y1 < 0) || (in_y1 > Y_MAX_Q8) ||
-        (in_y2 < 0) || (in_y2 > Y_MAX_Q8);
-
-    function signed [17:0] clamp_coord;
-        input signed [31:0] raw;
-        input signed [31:0] max_q8;
-        begin
-            if (raw < 0)           clamp_coord = 18'sd0;
-            else if (raw > max_q8) clamp_coord = max_q8[17:0];
-            else                   clamp_coord = raw[17:0];
-        end
-    endfunction
-
-    reg signed [17:0] s0_x0, s0_y0, s0_x1, s0_y1, s0_x2, s0_y2;
-    reg signed [31:0] s0_z0, s0_z1, s0_z2;
-    reg        [15:0] s0_color;
-    reg               s0_xy_bad;
-
-    always @(posedge clk) begin
-        if (pipe_advance && in_valid) begin
-            s0_x0 <= clamp_coord(in_x0, X_MAX_Q8);
-            s0_y0 <= clamp_coord(in_y0, Y_MAX_Q8);
-            s0_x1 <= clamp_coord(in_x1, X_MAX_Q8);
-            s0_y1 <= clamp_coord(in_y1, Y_MAX_Q8);
-            s0_x2 <= clamp_coord(in_x2, X_MAX_Q8);
-            s0_y2 <= clamp_coord(in_y2, Y_MAX_Q8);
-            s0_z0 <= in_z0;  s0_z1 <= in_z1;  s0_z2 <= in_z2;
-            s0_color  <= in_face_color;
-            s0_xy_bad <= input_xy_range_bad;
-        end
-    end
-
-    // =========================================================================
-    // S1: differences and bbox min/max
-    // =========================================================================
-    // Clamped coordinates are in [0, 102400], so every difference is within
-    // +/-102400 and fits signed 18 bits -> each x*y product fits one DSP48E1
-    // (25x18) instead of two.
-    reg signed [17:0] s1_dx1, s1_dy1, s1_dx2, s1_dy2;
-    reg signed [32:0] s1_dz1, s1_dz2;
-    reg signed [17:0] s1_e0a, s1_e0b, s1_e1a, s1_e1b, s1_e2a, s1_e2b;
-    reg signed [17:0] s1_x0, s1_y0, s1_x1, s1_y1, s1_x2, s1_y2;
-    reg signed [17:0] s1_xmin, s1_xmax, s1_ymin, s1_ymax;
-    reg signed [31:0] s1_z0;
-    reg        [15:0] s1_color;
-    reg               s1_xy_bad;
-
-    function signed [17:0] min3;
-        input signed [17:0] a, b, c;
-        reg signed [17:0] t;
-        begin
-            t = (b < a) ? b : a;
-            min3 = (c < t) ? c : t;
-        end
-    endfunction
-
-    function signed [17:0] max3;
-        input signed [17:0] a, b, c;
-        reg signed [17:0] t;
-        begin
-            t = (b > a) ? b : a;
-            max3 = (c > t) ? c : t;
-        end
-    endfunction
-
-    always @(posedge clk) begin
-        if (pipe_advance) begin
-            s1_dx1 <= s0_x1 - s0_x0;
-            s1_dy1 <= s0_y1 - s0_y0;
-            s1_dx2 <= s0_x2 - s0_x0;
-            s1_dy2 <= s0_y2 - s0_y0;
-            s1_dz1 <= s0_z1 - s0_z0;      // 33-bit signed context: exact
-            s1_dz2 <= s0_z2 - s0_z0;
-            // Directed edges (0->1), (1->2), (2->0): A = yi - yj, B = xj - xi
-            s1_e0a <= s0_y0 - s0_y1;  s1_e0b <= s0_x1 - s0_x0;
-            s1_e1a <= s0_y1 - s0_y2;  s1_e1b <= s0_x2 - s0_x1;
-            s1_e2a <= s0_y2 - s0_y0;  s1_e2b <= s0_x0 - s0_x2;
-            s1_x0 <= s0_x0; s1_y0 <= s0_y0;
-            s1_x1 <= s0_x1; s1_y1 <= s0_y1;
-            s1_x2 <= s0_x2; s1_y2 <= s0_y2;
-            s1_xmin <= min3(s0_x0, s0_x1, s0_x2);
-            s1_xmax <= max3(s0_x0, s0_x1, s0_x2);
-            s1_ymin <= min3(s0_y0, s0_y1, s0_y2);
-            s1_ymax <= max3(s0_y0, s0_y1, s0_y2);
-            s1_z0     <= s0_z0;
-            s1_color  <= s0_color;
-            s1_xy_bad <= s0_xy_bad;
-        end
-    end
-
-    // =========================================================================
-    // S2: products (maps to DSP48E1 with MREG) and bbox integer conversion
-    // =========================================================================
-    // floor/ceil of a Q.8 value. Fix vs rev A: the round-up bit is now a signed
-    // {0,bit} operand. In rev A, "$signed(raw>>>8) + (|raw[7:0])" mixed a
-    // signed and an unsigned operand, which makes the whole sum UNSIGNED and
-    // zero-extends a negative quotient (latent bug, masked only because the
-    // S0 clamp keeps raw >= 0).
-    function signed [18:0] q8_floor;
-        input signed [17:0] raw;
-        begin
-            q8_floor = raw >>> 8;
-        end
-    endfunction
-
-    function signed [18:0] q8_ceil;
-        input signed [17:0] raw;
-        begin
-            q8_ceil = (raw >>> 8) + $signed({1'b0, |raw[7:0]});
-        end
-    endfunction
-
-    function [9:0] clamp_pix;
-        input signed [18:0] v_in;
-        input integer       vmax;
-        begin
-            if (v_in < 0)         clamp_pix = 10'd0;
-            else if (v_in > vmax) clamp_pix = vmax;
-            else                  clamp_pix = v_in[9:0];
-        end
-    endfunction
-
-    function out_of_pix;
-        input signed [18:0] v_in;
-        input integer       vmax;
-        begin
-            out_of_pix = (v_in < 0) || (v_in > vmax);
-        end
-    endfunction
-
-    wire signed [18:0] s1_xlo = q8_floor(s1_xmin);
-    wire signed [18:0] s1_xhi = q8_ceil (s1_xmax);
-    wire signed [18:0] s1_ylo = q8_floor(s1_ymin);
-    wire signed [18:0] s1_yhi = q8_ceil (s1_ymax);
-
-    reg signed [35:0] s2_p_d0, s2_p_d1;                 // dx1*dy2, dx2*dy1
-    reg signed [50:0] s2_p_nx0, s2_p_nx1;               // dz1*dy2, dz2*dy1
-    reg signed [50:0] s2_p_ny0, s2_p_ny1;               // dx1*dz2, dx2*dz1
-    reg signed [35:0] s2_e0p0, s2_e0p1, s2_e1p0, s2_e1p1, s2_e2p0, s2_e2p1;
-    reg signed [17:0] s2_e0a, s2_e0b, s2_e1a, s2_e1b, s2_e2a, s2_e2b;
-    reg        [9:0]  s2_bxmin, s2_bxmax, s2_bymin, s2_bymax;
-    reg               s2_bbox_clamped;
-    reg signed [17:0] s2_x0, s2_y0;
-    reg signed [31:0] s2_z0;
-    reg        [15:0] s2_color;
-    reg               s2_xy_bad;
-
-    always @(posedge clk) begin
-        if (pipe_advance) begin
-            s2_p_d0  <= s1_dx1 * s1_dy2;
-            s2_p_d1  <= s1_dx2 * s1_dy1;
-            s2_p_nx0 <= s1_dz1 * s1_dy2;
-            s2_p_nx1 <= s1_dz2 * s1_dy1;
-            s2_p_ny0 <= s1_dx1 * s1_dz2;
-            s2_p_ny1 <= s1_dx2 * s1_dz1;
-            s2_e0p0 <= s1_x0 * s1_y1;  s2_e0p1 <= s1_x1 * s1_y0;
-            s2_e1p0 <= s1_x1 * s1_y2;  s2_e1p1 <= s1_x2 * s1_y1;
-            s2_e2p0 <= s1_x2 * s1_y0;  s2_e2p1 <= s1_x0 * s1_y2;
-            s2_e0a <= s1_e0a; s2_e0b <= s1_e0b;
-            s2_e1a <= s1_e1a; s2_e1b <= s1_e1b;
-            s2_e2a <= s1_e2a; s2_e2b <= s1_e2b;
-            s2_bxmin <= clamp_pix(s1_xlo, X_PIX_MAX);
-            s2_bxmax <= clamp_pix(s1_xhi, X_PIX_MAX);
-            s2_bymin <= clamp_pix(s1_ylo, Y_PIX_MAX);
-            s2_bymax <= clamp_pix(s1_yhi, Y_PIX_MAX);
-            s2_bbox_clamped <= out_of_pix(s1_xlo, X_PIX_MAX) | out_of_pix(s1_xhi, X_PIX_MAX) |
-                               out_of_pix(s1_ylo, Y_PIX_MAX) | out_of_pix(s1_yhi, Y_PIX_MAX);
-            s2_x0 <= s1_x0; s2_y0 <= s1_y0; s2_z0 <= s1_z0;
-            s2_color  <= s1_color;
-            s2_xy_bad <= s1_xy_bad;
-        end
-    end
-
-    // =========================================================================
-    // S3: determinant, plane numerators, edge C (DSP48E1 post-adder / PREG)
-    // =========================================================================
-    wire signed [36:0] s2_e0c = s2_e0p0 - s2_e0p1;
-    wire signed [36:0] s2_e1c = s2_e1p0 - s2_e1p1;
-    wire signed [36:0] s2_e2c = s2_e2p0 - s2_e2p1;
-
-    reg signed [38:0] s3_d;
-    reg signed [52:0] s3_nx, s3_ny;
-    reg signed [33:0] s3_e0c, s3_e1c, s3_e2c;
-    reg               s3_edge_c_ov;
-    reg signed [17:0] s3_e0a, s3_e0b, s3_e1a, s3_e1b, s3_e2a, s3_e2b;
-    reg        [9:0]  s3_bxmin, s3_bxmax, s3_bymin, s3_bymax;
-    reg               s3_bbox_clamped;
-    reg signed [17:0] s3_x0, s3_y0;
-    reg signed [31:0] s3_z0;
-    reg        [15:0] s3_color;
-    reg               s3_xy_bad;
-
-    always @(posedge clk) begin
-        if (pipe_advance) begin
-            s3_d  <= s2_p_d0  - s2_p_d1;
-            s3_nx <= s2_p_nx0 - s2_p_nx1;
-            s3_ny <= s2_p_ny0 - s2_p_ny1;
-            s3_e0c <= s2_e0c[33:0];
-            s3_e1c <= s2_e1c[33:0];
-            s3_e2c <= s2_e2c[33:0];
-            s3_edge_c_ov <= (s2_e0c[36:33] != {4{s2_e0c[33]}}) ||
-                            (s2_e1c[36:33] != {4{s2_e1c[33]}}) ||
-                            (s2_e2c[36:33] != {4{s2_e2c[33]}});
-            s3_e0a <= s2_e0a; s3_e0b <= s2_e0b;
-            s3_e1a <= s2_e1a; s3_e1b <= s2_e1b;
-            s3_e2a <= s2_e2a; s3_e2b <= s2_e2b;
-            s3_bxmin <= s2_bxmin; s3_bxmax <= s2_bxmax;
-            s3_bymin <= s2_bymin; s3_bymax <= s2_bymax;
-            s3_bbox_clamped <= s2_bbox_clamped;
-            s3_x0 <= s2_x0; s3_y0 <= s2_y0; s3_z0 <= s2_z0;
-            s3_color  <= s2_color;
-            s3_xy_bad <= s2_xy_bad;
-        end
-    end
-
-    // =========================================================================
-    // S4: |D| leading-one detect and normalize -> ROM address
-    // =========================================================================
-    reg [38:0] s3_dmag;
-    reg [5:0]  s3_dexp;
-    reg [38:0] s3_dnorm;
-    integer    nb;
+    // Range monitor runs on the full-width Q24.8 inputs, before narrowing.
+    // Endpoints are included: x=300 and y=400 are legal viewport boundaries.
+    reg input_xy_range_bad;
     always @* begin
-        s3_dmag = s3_d[38] ? (~s3_d + 39'd1) : s3_d;
-        s3_dexp = 6'd0;
-        for (nb = 0; nb < 39; nb = nb + 1)
-            if (s3_dmag[nb]) s3_dexp = nb[5:0];
-        s3_dnorm = s3_dmag << (6'd38 - s3_dexp);
+        input_xy_range_bad =
+            ($signed(in_x0) < 0 || $signed(in_x0) > 32'sd76800)  ||
+            ($signed(in_x1) < 0 || $signed(in_x1) > 32'sd76800)  ||
+            ($signed(in_x2) < 0 || $signed(in_x2) > 32'sd76800)  ||
+            ($signed(in_y0) < 0 || $signed(in_y0) > 32'sd102400) ||
+            ($signed(in_y1) < 0 || $signed(in_y1) > 32'sd102400) ||
+            ($signed(in_y2) < 0 || $signed(in_y2) > 32'sd102400);
     end
 
-    reg [9:0]         s4_addr;
-    reg [24:0]        s4_mant;             // |D| mantissa, Q1.24
-    reg [6:0]         s4_shift;            // e + 9
-    reg               s4_dneg, s4_degen;
-    reg signed [52:0] s4_nx, s4_ny;
-    reg signed [33:0] s4_e0c, s4_e1c, s4_e2c;
-    reg               s4_edge_c_ov;
-    reg signed [17:0] s4_e0a, s4_e0b, s4_e1a, s4_e1b, s4_e2a, s4_e2b;
-    reg        [9:0]  s4_bxmin, s4_bxmax, s4_bymin, s4_bymax;
-    reg               s4_bbox_clamped;
-    reg signed [17:0] s4_x0, s4_y0;
-    reg signed [31:0] s4_z0;
-    reg        [15:0] s4_color;
-    reg               s4_xy_bad;
+    // The base contract guarantees x/y are in [0,300] and [0,400] in screen
+    // space. This diagnostic variant checks that contract before narrowing.
+    // Invalid inputs are clamped to the supported viewport to prevent low-bit
+    // wraparound; overflow_xy_range tells downstream reg to reject/debug it.
+    function signed [17:0] clamp_input_x;
+        input signed [31:0] raw;
 
-    always @(posedge clk) begin
-        if (pipe_advance) begin
-            s4_addr  <= s3_dnorm[37:28];
-            s4_mant  <= s3_dnorm[38:14];
-            s4_shift <= {1'b0, s3_dexp} + 7'd9;
-            s4_dneg  <= s3_d[38];
-            s4_degen <= (s3_d == 39'sd0);
-            s4_nx <= s3_nx;  s4_ny <= s3_ny;
-            s4_e0c <= s3_e0c; s4_e1c <= s3_e1c; s4_e2c <= s3_e2c;
-            s4_edge_c_ov <= s3_edge_c_ov;
-            s4_e0a <= s3_e0a; s4_e0b <= s3_e0b;
-            s4_e1a <= s3_e1a; s4_e1b <= s3_e1b;
-            s4_e2a <= s3_e2a; s4_e2b <= s3_e2b;
-            s4_bxmin <= s3_bxmin; s4_bxmax <= s3_bxmax;
-            s4_bymin <= s3_bymin; s4_bymax <= s3_bymax;
-            s4_bbox_clamped <= s3_bbox_clamped;
-            s4_x0 <= s3_x0; s4_y0 <= s3_y0; s4_z0 <= s3_z0;
-            s4_color  <= s3_color;
-            s4_xy_bad <= s3_xy_bad;
-        end
-    end
-
-    // =========================================================================
-    // S5: reciprocal ROM, 1024 x 18 -> one RAMB18E1, registered output.
-    // Read is unconditional (degenerate triangles are zeroed later), so the
-    // output register has no data-dependent reset and maps cleanly to BRAM.
-    // =========================================================================
-    (* rom_style = "block" *) reg [17:0] recip_rom [0:1023];
-    initial $readmemh(RECIP_LUT_FILE, recip_rom);
-
-    reg [17:0] s5_inv;
-    always @(posedge clk)
-        if (pipe_advance) s5_inv <= recip_rom[s4_addr];
-
-    reg [24:0]        s5_mant;
-    reg [6:0]         s5_shift;
-    reg               s5_dneg, s5_degen;
-    reg signed [52:0] s5_nx, s5_ny;
-    reg signed [33:0] s5_e0c, s5_e1c, s5_e2c;
-    reg               s5_edge_c_ov;
-    reg signed [17:0] s5_e0a, s5_e0b, s5_e1a, s5_e1b, s5_e2a, s5_e2b;
-    reg        [9:0]  s5_bxmin, s5_bxmax, s5_bymin, s5_bymax;
-    reg               s5_bbox_clamped;
-    reg signed [17:0] s5_x0, s5_y0;
-    reg signed [31:0] s5_z0;
-    reg        [15:0] s5_color;
-    reg               s5_xy_bad;
-
-    always @(posedge clk) begin
-        if (pipe_advance) begin
-            s5_mant  <= s4_mant;
-            s5_shift <= s4_shift; s5_dneg <= s4_dneg; s5_degen <= s4_degen;
-            s5_nx <= s4_nx; s5_ny <= s4_ny;
-            s5_e0c <= s4_e0c; s5_e1c <= s4_e1c; s5_e2c <= s4_e2c;
-            s5_edge_c_ov <= s4_edge_c_ov;
-            s5_e0a <= s4_e0a; s5_e0b <= s4_e0b;
-            s5_e1a <= s4_e1a; s5_e1b <= s4_e1b;
-            s5_e2a <= s4_e2a; s5_e2b <= s4_e2b;
-            s5_bxmin <= s4_bxmin; s5_bxmax <= s4_bxmax;
-            s5_bymin <= s4_bymin; s5_bymax <= s4_bymax;
-            s5_bbox_clamped <= s4_bbox_clamped;
-            s5_x0 <= s4_x0; s5_y0 <= s4_y0; s5_z0 <= s4_z0;
-            s5_color  <= s4_color;
-            s5_xy_bad <= s4_xy_bad;
-        end
-    end
-
-    // =========================================================================
-    // Optional reciprocal refinement (Newton-Raphson, one iteration)
-    //   r1 = r0 * (2 - m*r0),   m = |D| mantissa Q1.24, r0 = LUT seed Q1.17
-    //   N1: t = m*r0 (Q2.41)        N2: e = round(2 - t) as Q1.24
-    //   N3: p = r0*e (Q2.41)        N4: r1 = round(p) as Q1.17  (<= 1.0)
-    // Each multiply is 25x18 -> exactly one DSP48E1. The rest of the S5
-    // payload is carried alongside in a plain delay line.
-    // =========================================================================
-    localparam integer PW = 7+1+1+53+53+3*34+1+6*18+4*10+1+18+18+32+16+1;
-    wire [PW-1:0] s5_pay = {s5_shift, s5_dneg, s5_degen, s5_nx, s5_ny,
-                            s5_e0c, s5_e1c, s5_e2c, s5_edge_c_ov,
-                            s5_e0a, s5_e0b, s5_e1a, s5_e1b, s5_e2a, s5_e2b,
-                            s5_bxmin, s5_bxmax, s5_bymin, s5_bymax, s5_bbox_clamped,
-                            s5_x0, s5_y0, s5_z0, s5_color, s5_xy_bad};
-    wire [PW-1:0] n_pay;
-    wire [17:0]   n_inv;
-
-    generate
-        if (RECIP_NR) begin : g_nr
-            reg [42:0]    n1_t;  reg [17:0] n1_r0;
-            reg [24:0]    n2_e;  reg [17:0] n2_r0;
-            reg [42:0]    n3_p;
-            reg [17:0]    n4_r;
-            reg [PW-1:0]  p1, p2, p3, p4;
-            wire [42:0]   n1_e_full = 43'h400_0000_0000 - n1_t;          // 2.0 - t
-            wire [42:0]   n3_rnd    = n3_p + 43'd8388608;                 // + 2^23
-            always @(posedge clk) begin
-                if (pipe_advance) begin
-                    n1_t  <= s5_mant * s5_inv;    n1_r0 <= s5_inv;  p1 <= s5_pay;
-                    n2_e  <= (n1_e_full + 43'd65536) >> 17;         n2_r0 <= n1_r0; p2 <= p1;
-                    n3_p  <= n2_r0 * n2_e;                                         p3 <= p2;
-                    n4_r  <= n3_rnd[41:24];                                        p4 <= p3;
-                end
-            end
-            assign n_pay = p4;
-            assign n_inv = n4_r;
-        end else begin : g_lut_only
-            assign n_pay = s5_pay;
-            assign n_inv = s5_inv;
-        end
-    endgenerate
-
-    wire [6:0]         n_shift;
-    wire               n_dneg, n_degen, n_edge_c_ov, n_bbox_clamped, n_xy_bad;
-    wire signed [52:0] n_nx, n_ny;
-    wire signed [33:0] n_e0c, n_e1c, n_e2c;
-    wire signed [17:0] n_e0a, n_e0b, n_e1a, n_e1b, n_e2a, n_e2b, n_x0, n_y0;
-    wire        [9:0]  n_bxmin, n_bxmax, n_bymin, n_bymax;
-    wire signed [31:0] n_z0;
-    wire        [15:0] n_color;
-    assign {n_shift, n_dneg, n_degen, n_nx, n_ny,
-            n_e0c, n_e1c, n_e2c, n_edge_c_ov,
-            n_e0a, n_e0b, n_e1a, n_e1b, n_e2a, n_e2b,
-            n_bxmin, n_bxmax, n_bymin, n_bymax, n_bbox_clamped,
-            n_x0, n_y0, n_z0, n_color, n_xy_bad} = n_pay;
-
-    // =========================================================================
-    // S6: N * (+/-inv_m). Folding sign(D) into the 19-bit multiplier operand
-    // replaces rev A's 80-bit post-multiply negation; result is identical
-    // because Nx*(-inv) == -(Nx*inv) exactly.
-    // =========================================================================
-    wire signed [18:0] n_inv_s = n_dneg ? -$signed({1'b0, n_inv})
-                                          :  $signed({1'b0, n_inv});
-
-    reg signed [71:0] s6_pa, s6_pb;
-    reg [6:0]         s6_shift;
-    reg               s6_dneg, s6_degen;
-    reg signed [33:0] s6_e0c, s6_e1c, s6_e2c;
-    reg               s6_edge_c_ov;
-    reg signed [17:0] s6_e0a, s6_e0b, s6_e1a, s6_e1b, s6_e2a, s6_e2b;
-    reg        [9:0]  s6_bxmin, s6_bxmax, s6_bymin, s6_bymax;
-    reg               s6_bbox_clamped;
-    reg signed [17:0] s6_x0, s6_y0;
-    reg signed [31:0] s6_z0;
-    reg        [15:0] s6_color;
-    reg               s6_xy_bad;
-
-    always @(posedge clk) begin
-        if (pipe_advance) begin
-            s6_pa <= n_nx * n_inv_s;
-            s6_pb <= n_ny * n_inv_s;
-            s6_shift <= n_shift; s6_dneg <= n_dneg; s6_degen <= n_degen;
-            s6_e0c <= n_e0c; s6_e1c <= n_e1c; s6_e2c <= n_e2c;
-            s6_edge_c_ov <= n_edge_c_ov;
-            s6_e0a <= n_e0a; s6_e0b <= n_e0b;
-            s6_e1a <= n_e1a; s6_e1b <= n_e1b;
-            s6_e2a <= n_e2a; s6_e2b <= n_e2b;
-            s6_bxmin <= n_bxmin; s6_bxmax <= n_bxmax;
-            s6_bymin <= n_bymin; s6_bymax <= n_bymax;
-            s6_bbox_clamped <= n_bbox_clamped;
-            s6_x0 <= n_x0; s6_y0 <= n_y0; s6_z0 <= n_z0;
-            s6_color  <= n_color;
-            s6_xy_bad <= n_xy_bad;
-        end
-    end
-
-    // =========================================================================
-    // S7: magnitude and variable right shift; keep guard/sticky for rounding.
-    // =========================================================================
-    // Split form of rev A depth_round_saturate():
-    //   q = |p| >> s, rem = |p| mod 2^s
-    //   overflow  <=>  |p| > L*2^s  <=>  q > L || (q == L && rem != 0)
-    //   with L = 2^31 (negative) or 2^31-1 (positive)
-    //   rounding: half-to-even on q using guard = rem[s-1], sticky = |rem[s-2:0]
-    function [35:0] shr_split;          // {q_hi_nz, guard, sticky, q[31:0], 1'b0}
-        input [71:0] mag;
-        input [6:0]  sh;                // 9..47
-        reg [71:0] q, mask;
         begin
-            q    = mag >> sh;
-            mask = (72'd1 << (sh - 7'd1)) - 72'd1;
-            shr_split = { |q[71:32],
-                          mag[sh - 7'd1],
-                          |(mag & mask),
-                          q[31:0],
-                          1'b0 };
+            if (raw < 0)               clamp_input_x = 18'sd0;
+            else if (raw > 32'sd76800) clamp_input_x = 18'sd76800;
+            else                       clamp_input_x = raw[17:0];
         end
     endfunction
 
-    wire [71:0] s6_maga = s6_pa[71] ? -s6_pa : s6_pa;
-    wire [71:0] s6_magb = s6_pb[71] ? -s6_pb : s6_pb;
-    wire [35:0] s6_sa   = shr_split(s6_maga, s6_shift);
-    wire [35:0] s6_sb   = shr_split(s6_magb, s6_shift);
+    function signed [17:0] clamp_input_y;
+        input signed [31:0] raw;
 
-    reg [35:0]        s7_sa, s7_sb;
-    reg               s7_nega, s7_negb;
-    reg               s7_dneg, s7_degen;
-    reg signed [33:0] s7_e0c, s7_e1c, s7_e2c;
-    reg               s7_edge_c_ov;
-    reg signed [17:0] s7_e0a, s7_e0b, s7_e1a, s7_e1b, s7_e2a, s7_e2b;
-    reg        [9:0]  s7_bxmin, s7_bxmax, s7_bymin, s7_bymax;
-    reg               s7_bbox_clamped;
-    reg signed [17:0] s7_x0, s7_y0;
-    reg signed [31:0] s7_z0;
-    reg        [15:0] s7_color;
-    reg               s7_xy_bad;
-
-    always @(posedge clk) begin
-        if (pipe_advance) begin
-            s7_sa <= s6_sa;  s7_nega <= s6_pa[71];
-            s7_sb <= s6_sb;  s7_negb <= s6_pb[71];
-            s7_dneg <= s6_dneg; s7_degen <= s6_degen;
-            s7_e0c <= s6_e0c; s7_e1c <= s6_e1c; s7_e2c <= s6_e2c;
-            s7_edge_c_ov <= s6_edge_c_ov;
-            s7_e0a <= s6_e0a; s7_e0b <= s6_e0b;
-            s7_e1a <= s6_e1a; s7_e1b <= s6_e1b;
-            s7_e2a <= s6_e2a; s7_e2b <= s6_e2b;
-            s7_bxmin <= s6_bxmin; s7_bxmax <= s6_bxmax;
-            s7_bymin <= s6_bymin; s7_bymax <= s6_bymax;
-            s7_bbox_clamped <= s6_bbox_clamped;
-            s7_x0 <= s6_x0; s7_y0 <= s6_y0; s7_z0 <= s6_z0;
-            s7_color  <= s6_color;
-            s7_xy_bad <= s6_xy_bad;
-        end
-    end
-
-    // =========================================================================
-    // S8: overflow test, round-half-even, saturate -> zA, zB (Q24.8)
-    // =========================================================================
-    function [32:0] round_sat;          // {overflow, value[31:0]}
-        input [35:0] sp;                // from shr_split
-        input        neg;
-        reg        hi_nz, g, st;
-        reg [31:0] q, lim;
-        reg        ov;
-        reg [32:0] r;
         begin
-            hi_nz = sp[35]; g = sp[34]; st = sp[33]; q = sp[32:1];
-            lim   = neg ? 32'h8000_0000 : 32'h7fff_ffff;
-            ov    = hi_nz || (q > lim) || ((q == lim) && (g || st));
-            if (ov)
-                round_sat = {1'b1, neg ? 32'h8000_0000 : 32'h7fff_ffff};
-            else begin
-                r = {1'b0, q} + {32'd0, g && (st || q[0])};
-                round_sat = {1'b0, neg ? (32'd0 - r[31:0]) : r[31:0]};
-            end
+            if (raw < 0)                clamp_input_y = 18'sd0;
+            else if (raw > 32'sd102400) clamp_input_y = 18'sd102400;
+            else                        clamp_input_y = raw[17:0];
         end
     endfunction
-
-    wire [32:0] s7_za = s7_degen ? 33'd0 : round_sat(s7_sa, s7_nega);
-    wire [32:0] s7_zb = s7_degen ? 33'd0 : round_sat(s7_sb, s7_negb);
-
-    reg signed [31:0] s8_za, s8_zb;
-    reg               s8_ova, s8_ovb;
-    reg               s8_dneg, s8_degen;
-    reg signed [33:0] s8_e0c, s8_e1c, s8_e2c;
-    reg               s8_edge_c_ov;
-    reg signed [17:0] s8_e0a, s8_e0b, s8_e1a, s8_e1b, s8_e2a, s8_e2b;
-    reg        [9:0]  s8_bxmin, s8_bxmax, s8_bymin, s8_bymax;
-    reg               s8_bbox_clamped;
-    reg signed [17:0] s8_x0, s8_y0;
-    reg signed [31:0] s8_z0;
-    reg        [15:0] s8_color;
-    reg               s8_xy_bad;
-
-    always @(posedge clk) begin
-        if (pipe_advance) begin
-            s8_za <= s7_za[31:0]; s8_ova <= s7_za[32];
-            s8_zb <= s7_zb[31:0]; s8_ovb <= s7_zb[32];
-            s8_dneg <= s7_dneg; s8_degen <= s7_degen;
-            s8_e0c <= s7_e0c; s8_e1c <= s7_e1c; s8_e2c <= s7_e2c;
-            s8_edge_c_ov <= s7_edge_c_ov;
-            s8_e0a <= s7_e0a; s8_e0b <= s7_e0b;
-            s8_e1a <= s7_e1a; s8_e1b <= s7_e1b;
-            s8_e2a <= s7_e2a; s8_e2b <= s7_e2b;
-            s8_bxmin <= s7_bxmin; s8_bxmax <= s7_bxmax;
-            s8_bymin <= s7_bymin; s8_bymax <= s7_bymax;
-            s8_bbox_clamped <= s7_bbox_clamped;
-            s8_x0 <= s7_x0; s8_y0 <= s7_y0; s8_z0 <= s7_z0;
-            s8_color  <= s7_color;
-            s8_xy_bad <= s7_xy_bad;
-        end
-    end
-
-    // =========================================================================
-    // S9: zA*x0, zB*y0 (Q16), from the exact zA/zB that will be output
-    // =========================================================================
-    reg signed [49:0] s9_pax, s9_pby;
-    reg signed [31:0] s9_za, s9_zb;
-    reg               s9_ova, s9_ovb;
-    reg               s9_dneg, s9_degen;
-    reg signed [33:0] s9_e0c, s9_e1c, s9_e2c;
-    reg               s9_edge_c_ov;
-    reg signed [17:0] s9_e0a, s9_e0b, s9_e1a, s9_e1b, s9_e2a, s9_e2b;
-    reg        [9:0]  s9_bxmin, s9_bxmax, s9_bymin, s9_bymax;
-    reg               s9_bbox_clamped;
-    reg signed [31:0] s9_z0;
-    reg        [15:0] s9_color;
-    reg               s9_xy_bad;
-
-    always @(posedge clk) begin
-        if (pipe_advance) begin
-            s9_pax <= s8_za * s8_x0;
-            s9_pby <= s8_zb * s8_y0;
-            s9_za <= s8_za; s9_zb <= s8_zb;
-            s9_ova <= s8_ova; s9_ovb <= s8_ovb;
-            s9_dneg <= s8_dneg; s9_degen <= s8_degen;
-            s9_e0c <= s8_e0c; s9_e1c <= s8_e1c; s9_e2c <= s8_e2c;
-            s9_edge_c_ov <= s8_edge_c_ov;
-            s9_e0a <= s8_e0a; s9_e0b <= s8_e0b;
-            s9_e1a <= s8_e1a; s9_e1b <= s8_e1b;
-            s9_e2a <= s8_e2a; s9_e2b <= s8_e2b;
-            s9_bxmin <= s8_bxmin; s9_bxmax <= s8_bxmax;
-            s9_bymin <= s8_bymin; s9_bymax <= s8_bymax;
-            s9_bbox_clamped <= s8_bbox_clamped;
-            s9_z0 <= s8_z0;
-            s9_color  <= s8_color;
-            s9_xy_bad <= s8_xy_bad;
-        end
-    end
-
-    // =========================================================================
-    // S10: zC = round_sat((z0<<8 - zA*x0 - zB*y0) >> 8), output registers
-    // =========================================================================
-    wire signed [50:0] s9_zc_q16 = ($signed(s9_z0) <<< 8) - s9_pax - s9_pby;
-    wire        [50:0] s9_zc_mag = s9_zc_q16[50] ? -s9_zc_q16 : s9_zc_q16;
-    wire        [42:0] s9_zc_q   = s9_zc_mag[50:8];
-    wire [35:0] s9_zc_sp = { |s9_zc_q[42:32], s9_zc_mag[7], |s9_zc_mag[6:0],
-                             s9_zc_q[31:0], 1'b0 };
-    wire [32:0] s9_zc = s9_degen ? 33'd0 : round_sat(s9_zc_sp, s9_zc_q16[50]);
-
-    always @(posedge clk) begin
-        if (pipe_advance && v[LATENCY-1]) begin
-            bbox_xmin <= s9_bxmin;  bbox_xmax <= s9_bxmax;
-            bbox_ymin <= s9_bymin;  bbox_ymax <= s9_bymax;
-            edge0_A <= s9_e0a; edge0_B <= s9_e0b; edge0_C <= s9_e0c;
-            edge1_A <= s9_e1a; edge1_B <= s9_e1b; edge1_C <= s9_e1c;
-            edge2_A <= s9_e2a; edge2_B <= s9_e2b; edge2_C <= s9_e2c;
-            zA <= s9_za;
-            zB <= s9_zb;
-            zC <= s9_zc[31:0];
-            face_color <= s9_color;
-        end
-    end
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            overflow          <= 1'b0;
+            r0_valid <= 1'b0;
+            r0_xy_range_bad <= 1'b0;
+        end else if (pipe_advance) begin
+            r0_valid <= in_valid;
+            if (in_valid) begin
+                r0_xy_range_bad <= input_xy_range_bad;
+                r0_x0   <= clamp_input_x(in_x0);
+                r0_y0   <= clamp_input_y(in_y0);
+                r0_x1   <= clamp_input_x(in_x1);
+                r0_y1   <= clamp_input_y(in_y1);
+                r0_x2   <= clamp_input_x(in_x2);
+                r0_y2   <= clamp_input_y(in_y2);
+                r0_z0   <= in_z0;
+                r0_z1   <= in_z1;
+                r0_z2   <= in_z2;
+                r0_color<= in_face_color;
+            end
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // Stage R1 combinational calculations (all branches in parallel)
+    // -------------------------------------------------------------------------
+    reg signed [18:0] r0_dx1, r0_dy1, r0_dx2, r0_dy2;
+    reg signed [32:0] r0_dz1, r0_dz2;
+    reg signed [37:0] r0_p_dx1_dy2, r0_p_dx2_dy1;
+    reg signed [38:0] r0_d_calc;
+    reg signed [51:0] r0_p_dz1_dy2, r0_p_dz2_dy1;
+    reg signed [51:0] r0_p_dx1_dz2, r0_p_dx2_dz1;
+    reg signed [52:0] r0_nx_calc, r0_ny_calc;
+
+    reg signed [18:0] r0_e0_a, r0_e0_b, r0_e1_a, r0_e1_b, r0_e2_a, r0_e2_b;
+    reg signed [35:0] r0_e0_p0, r0_e0_p1, r0_e1_p0, r0_e1_p1, r0_e2_p0, r0_e2_p1;
+    reg signed [36:0] r0_e0_c, r0_e1_c, r0_e2_c;
+
+    reg signed [17:0] r0_x_min, r0_x_max, r0_y_min, r0_y_max;
+
+    always @* begin
+        r0_dx1 = $signed({r0_x1[17], r0_x1}) - $signed({r0_x0[17], r0_x0});
+        r0_dy1 = $signed({r0_y1[17], r0_y1}) - $signed({r0_y0[17], r0_y0});
+        r0_dx2 = $signed({r0_x2[17], r0_x2}) - $signed({r0_x0[17], r0_x0});
+        r0_dy2 = $signed({r0_y2[17], r0_y2}) - $signed({r0_y0[17], r0_y0});
+        r0_dz1 = $signed({r0_z1[31], r0_z1}) - $signed({r0_z0[31], r0_z0});
+        r0_dz2 = $signed({r0_z2[31], r0_z2}) - $signed({r0_z0[31], r0_z0});
+
+        r0_p_dx1_dy2 = $signed({{19{r0_dx1[18]}},r0_dx1}) *
+                       $signed({{19{r0_dy2[18]}},r0_dy2});
+        r0_p_dx2_dy1 = $signed({{19{r0_dx2[18]}},r0_dx2}) *
+                       $signed({{19{r0_dy1[18]}},r0_dy1});
+        r0_d_calc = $signed({r0_p_dx1_dy2[37], r0_p_dx1_dy2}) -
+                    $signed({r0_p_dx2_dy1[37], r0_p_dx2_dy1});
+
+        r0_p_dz1_dy2 = $signed({{19{r0_dz1[32]}},r0_dz1}) *
+                       $signed({{33{r0_dy2[18]}},r0_dy2});
+        r0_p_dz2_dy1 = $signed({{19{r0_dz2[32]}},r0_dz2}) *
+                       $signed({{33{r0_dy1[18]}},r0_dy1});
+        r0_p_dx1_dz2 = $signed({{33{r0_dx1[18]}},r0_dx1}) *
+                       $signed({{19{r0_dz2[32]}},r0_dz2});
+        r0_p_dx2_dz1 = $signed({{33{r0_dx2[18]}},r0_dx2}) *
+                       $signed({{19{r0_dz1[32]}},r0_dz1});
+        r0_nx_calc = $signed({r0_p_dz1_dy2[51], r0_p_dz1_dy2}) -
+                     $signed({r0_p_dz2_dy1[51], r0_p_dz2_dy1});
+        r0_ny_calc = $signed({r0_p_dx1_dz2[51], r0_p_dx1_dz2}) -
+                     $signed({r0_p_dx2_dz1[51], r0_p_dx2_dz1});
+
+        // Directed edges: (0->1), (1->2), (2->0).
+        r0_e0_a = $signed({r0_y0[17],r0_y0}) - $signed({r0_y1[17],r0_y1});
+        r0_e0_b = $signed({r0_x1[17],r0_x1}) - $signed({r0_x0[17],r0_x0});
+        r0_e1_a = $signed({r0_y1[17],r0_y1}) - $signed({r0_y2[17],r0_y2});
+        r0_e1_b = $signed({r0_x2[17],r0_x2}) - $signed({r0_x1[17],r0_x1});
+        r0_e2_a = $signed({r0_y2[17],r0_y2}) - $signed({r0_y0[17],r0_y0});
+        r0_e2_b = $signed({r0_x0[17],r0_x0}) - $signed({r0_x2[17],r0_x2});
+
+        r0_e0_p0 = $signed({{18{r0_x0[17]}},r0_x0}) * $signed({{18{r0_y1[17]}},r0_y1});
+        r0_e0_p1 = $signed({{18{r0_x1[17]}},r0_x1}) * $signed({{18{r0_y0[17]}},r0_y0});
+        r0_e1_p0 = $signed({{18{r0_x1[17]}},r0_x1}) * $signed({{18{r0_y2[17]}},r0_y2});
+        r0_e1_p1 = $signed({{18{r0_x2[17]}},r0_x2}) * $signed({{18{r0_y1[17]}},r0_y1});
+        r0_e2_p0 = $signed({{18{r0_x2[17]}},r0_x2}) * $signed({{18{r0_y0[17]}},r0_y0});
+        r0_e2_p1 = $signed({{18{r0_x0[17]}},r0_x0}) * $signed({{18{r0_y2[17]}},r0_y2});
+        r0_e0_c = $signed({r0_e0_p0[35],r0_e0_p0}) - $signed({r0_e0_p1[35],r0_e0_p1});
+        r0_e1_c = $signed({r0_e1_p0[35],r0_e1_p0}) - $signed({r0_e1_p1[35],r0_e1_p1});
+        r0_e2_c = $signed({r0_e2_p0[35],r0_e2_p0}) - $signed({r0_e2_p1[35],r0_e2_p1});
+
+        r0_x_min = r0_x0;
+        r0_x_max = r0_x0;
+        r0_y_min = r0_y0;
+        r0_y_max = r0_y0;
+        if (r0_x1 < r0_x_min) r0_x_min = r0_x1;
+        if (r0_x2 < r0_x_min) r0_x_min = r0_x2;
+        if (r0_x1 > r0_x_max) r0_x_max = r0_x1;
+        if (r0_x2 > r0_x_max) r0_x_max = r0_x2;
+        if (r0_y1 < r0_y_min) r0_y_min = r0_y1;
+        if (r0_y2 < r0_y_min) r0_y_min = r0_y2;
+        if (r0_y1 > r0_y_max) r0_y_max = r0_y1;
+        if (r0_y2 > r0_y_max) r0_y_max = r0_y2;
+    end
+
+    // R1 registers hold the independent branch results and data needed later.
+    reg                r1_valid;
+    reg signed [38:0]  r1_d;
+    reg signed [52:0]  r1_nx, r1_ny;
+    reg signed [17:0]  r1_xmin_raw, r1_xmax_raw, r1_ymin_raw, r1_ymax_raw;
+    reg signed [18:0]  r1_e0_a, r1_e0_b, r1_e1_a, r1_e1_b, r1_e2_a, r1_e2_b;
+    reg signed [36:0]  r1_e0_c, r1_e1_c, r1_e2_c;
+    reg signed [17:0]  r1_x0, r1_y0;
+    reg signed [31:0]  r1_z0;
+    reg        [15:0]  r1_color;
+    reg                r1_xy_range_bad;
+    reg                r1_edge_c_overflow;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            r1_valid <= 1'b0;
+            r1_xy_range_bad <= 1'b0;
+            r1_edge_c_overflow <= 1'b0;
+        end else if (pipe_advance) begin
+            r1_valid <= r0_valid;
+            if (r0_valid) begin
+                r1_d       <= r0_d_calc;
+                r1_nx      <= r0_nx_calc;
+                r1_ny      <= r0_ny_calc;
+                r1_xmin_raw<= r0_x_min;
+                r1_xmax_raw<= r0_x_max;
+                r1_ymin_raw<= r0_y_min;
+                r1_ymax_raw<= r0_y_max;
+                r1_e0_a    <= r0_e0_a; r1_e0_b <= r0_e0_b; r1_e0_c <= r0_e0_c;
+                r1_e1_a    <= r0_e1_a; r1_e1_b <= r0_e1_b; r1_e1_c <= r0_e1_c;
+                r1_e2_a    <= r0_e2_a; r1_e2_b <= r0_e2_b; r1_e2_c <= r0_e2_c;
+                r1_x0      <= r0_x0;   r1_y0   <= r0_y0;
+                r1_z0      <= r0_z0;
+                r1_color   <= r0_color;
+                r1_xy_range_bad <= r0_xy_range_bad;
+                // A signed 37-bit C is representable in signed 34 bits only
+                // when its three discarded upper bits repeat bit 33.
+                r1_edge_c_overflow <=
+                    (r0_e0_c[36:34] != {3{r0_e0_c[33]}}) ||
+                    (r0_e1_c[36:34] != {3{r0_e1_c[33]}}) ||
+                    (r0_e2_c[36:34] != {3{r0_e2_c[33]}});
+            end
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // Reciprocal ROM address generation from R1 determinant
+    // -------------------------------------------------------------------------
+    reg [38:0] d_magnitude;
+    reg [38:0] d_normalized;
+    reg [5:0]  d_exponent;
+    reg [9:0]  recip_address;
+    integer      norm_bit;
+
+    always @* begin
+        if (r1_d[38])
+            d_magnitude = (~r1_d) + 39'd1;
+        else
+            d_magnitude = r1_d;
+
+        d_exponent = 6'd0;
+        for (norm_bit = 0; norm_bit < 39; norm_bit = norm_bit + 1)
+            if (d_magnitude[norm_bit]) d_exponent = norm_bit[5:0];
+
+        d_normalized = 39'd0;
+        if (d_magnitude != 0)
+            d_normalized = d_magnitude << (38 - d_exponent);
+        recip_address = d_normalized[37:28];
+    end
+
+    reg [17:0] recip_rom [0:1023];
+    reg [17:0] recip_rom_q;
+    initial begin
+        $readmemh(RECIP_LUT_FILE, recip_rom);
+    end
+
+    // Synchronous ROM read; CE follows the global pipeline advance.
+    always @(posedge clk) begin
+        if (pipe_advance) begin
+            if (r1_valid && (r1_d != 0))
+                recip_rom_q <= recip_rom[recip_address];
+            else
+                recip_rom_q <= 18'd0;
+        end
+    end
+
+    // -------------------------------------------------------------------------
+    // Stage R2: bounding-box conversion, reciprocal capture, alignment
+    // -------------------------------------------------------------------------
+    function [9:0] bbox_floor_clamp_x;
+        input signed [17:0] raw;
+
+        reg signed [17:0] whole;
+        begin
+            whole = raw >>> 8;
+            if (whole < 0)       bbox_floor_clamp_x = 10'd0;
+            else if (whole > 299)bbox_floor_clamp_x = 10'd299;
+            else                 bbox_floor_clamp_x = whole[9:0];
+        end
+    endfunction
+
+    function [9:0] bbox_ceil_clamp_x;
+        input signed [17:0] raw;
+
+        reg signed [18:0] whole_ceil;
+        begin
+            whole_ceil = $signed(raw >>> 8) + (|raw[7:0]);
+            if (whole_ceil < 0)       bbox_ceil_clamp_x = 10'd0;
+            else if (whole_ceil > 299)bbox_ceil_clamp_x = 10'd299;
+            else                     bbox_ceil_clamp_x = whole_ceil[9:0];
+        end
+    endfunction
+
+    function [9:0] bbox_floor_clamp_y;
+        input signed [17:0] raw;
+
+        reg signed [17:0] whole;
+        begin
+            whole = raw >>> 8;
+            if (whole < 0)       bbox_floor_clamp_y = 10'd0;
+            else if (whole > 399)bbox_floor_clamp_y = 10'd399;
+            else                 bbox_floor_clamp_y = whole[9:0];
+        end
+    endfunction
+
+    function [9:0] bbox_ceil_clamp_y;
+        input signed [17:0] raw;
+
+        reg signed [18:0] whole_ceil;
+        begin
+            whole_ceil = $signed(raw >>> 8) + (|raw[7:0]);
+            if (whole_ceil < 0)       bbox_ceil_clamp_y = 10'd0;
+            else if (whole_ceil > 399)bbox_ceil_clamp_y = 10'd399;
+            else                     bbox_ceil_clamp_y = whole_ceil[9:0];
+        end
+    endfunction
+
+    // Separate diagnostic: reaching/clamping the viewport edge is expected
+    // behavior and is not itself an arithmetic overflow. All debug flags are
+    // per-output-triangle flags, aligned with out_valid (not sticky history).
+    function  bbox_clamp_needed_x;
+        input signed [17:0] min_raw;
+        input signed [17:0] max_raw;
+
+        reg signed [18:0] lo, hi;
+        begin
+            lo = min_raw >>> 8;
+            hi = $signed(max_raw >>> 8) + (|max_raw[7:0]);
+            bbox_clamp_needed_x = (lo < 0) || (lo > 299) || (hi < 0) || (hi > 299);
+        end
+    endfunction
+
+    function  bbox_clamp_needed_y;
+        input signed [17:0] min_raw;
+        input signed [17:0] max_raw;
+
+        reg signed [18:0] lo, hi;
+        begin
+            lo = min_raw >>> 8;
+            hi = $signed(max_raw >>> 8) + (|max_raw[7:0]);
+            bbox_clamp_needed_y = (lo < 0) || (lo > 399) || (hi < 0) || (hi > 399);
+        end
+    endfunction
+
+    reg                r2_valid;
+    reg        [9:0]   r2_bbox_xmin, r2_bbox_xmax, r2_bbox_ymin, r2_bbox_ymax;
+    reg signed [31:0]  r2_e0_a, r2_e0_b, r2_e1_a, r2_e1_b, r2_e2_a, r2_e2_b;
+    reg signed [33:0]  r2_e0_c, r2_e1_c, r2_e2_c;
+    reg signed [52:0]  r2_nx, r2_ny;
+    reg signed [17:0]  r2_x0, r2_y0;
+    reg signed [31:0]  r2_z0;
+    reg        [15:0]  r2_color;
+    wire [17:0]         r2_inv_m;
+    reg [5:0]          r2_exp;
+    reg                r2_d_neg, r2_degenerate;
+    reg                r2_xy_range_bad, r2_edge_c_overflow, r2_bbox_clamped;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            r2_valid <= 1'b0;
+            r2_xy_range_bad <= 1'b0;
+            r2_edge_c_overflow <= 1'b0;
+            r2_bbox_clamped <= 1'b0;
+        end else if (pipe_advance) begin
+            r2_valid <= r1_valid;
+            if (r1_valid) begin
+                r2_bbox_xmin <= bbox_floor_clamp_x(r1_xmin_raw);
+                r2_bbox_xmax <= bbox_ceil_clamp_x (r1_xmax_raw);
+                r2_bbox_ymin <= bbox_floor_clamp_y(r1_ymin_raw);
+                r2_bbox_ymax <= bbox_ceil_clamp_y (r1_ymax_raw);
+
+                r2_e0_a <= {{13{r1_e0_a[18]}}, r1_e0_a};
+                r2_e0_b <= {{13{r1_e0_b[18]}}, r1_e0_b};
+                r2_e1_a <= {{13{r1_e1_a[18]}}, r1_e1_a};
+                r2_e1_b <= {{13{r1_e1_b[18]}}, r1_e1_b};
+                r2_e2_a <= {{13{r1_e2_a[18]}}, r1_e2_a};
+                r2_e2_b <= {{13{r1_e2_b[18]}}, r1_e2_b};
+                // Under the guaranteed screen-space range, each C fits signed
+                // Q18.16 / 34 bits; retain the low 34 two's-complement bits.
+                r2_e0_c <= r1_e0_c[33:0];
+                r2_e1_c <= r1_e1_c[33:0];
+                r2_e2_c <= r1_e2_c[33:0];
+
+                r2_nx        <= r1_nx;
+                r2_ny        <= r1_ny;
+                r2_x0        <= r1_x0;
+                r2_y0        <= r1_y0;
+                r2_z0        <= r1_z0;
+                r2_color     <= r1_color;
+                r2_exp       <= d_exponent;
+                r2_d_neg     <= r1_d[38];
+                r2_degenerate<= (r1_d == 0);
+                r2_xy_range_bad <= r1_xy_range_bad;
+                r2_edge_c_overflow <= r1_edge_c_overflow;
+                r2_bbox_clamped <= bbox_clamp_needed_x(r1_xmin_raw, r1_xmax_raw) |
+                                   bbox_clamp_needed_y(r1_ymin_raw, r1_ymax_raw);
+            end
+        end
+    end
+
+    // The synchronous ROM output itself is the R2 reciprocal register. It is
+    // updated on the same edge as the R2 payload registers, so both are aligned.
+    assign r2_inv_m = recip_rom_q;
+
+    // -------------------------------------------------------------------------
+    // Stage R3 combinational depth conversion and saturation
+    // -------------------------------------------------------------------------
+    function signed [79:0] round_shift_even;
+        input signed [79:0] value;
+        input [6:0] shift;
+
+        reg [79:0] magnitude;
+        reg [79:0] quotient;
+        reg [79:0] low_mask;
+        reg        guard_bit;
+        reg        sticky_bit;
+        begin
+            if (shift == 0) begin
+                round_shift_even = value;
+            end else begin
+                magnitude = value[79] ? (~value + 80'd1) : value;
+                quotient  = magnitude >> shift;
+                guard_bit = (magnitude >> (shift - 1'b1)) & 80'd1;
+                if (shift > 1) begin
+                    low_mask = (80'd1 << (shift - 1'b1)) - 80'd1;
+                    sticky_bit = |(magnitude & low_mask);
+                end else begin
+                    sticky_bit = 1'b0;
+                end
+                if (guard_bit && (sticky_bit || quotient[0]))
+                    quotient = quotient + 80'd1;
+                round_shift_even = value[79] ? -$signed(quotient) : $signed(quotient);
+            end
+        end
+    endfunction
+
+    // Returns {overflow, saturated_signed_Q24.8}. Range is checked against the
+    // unrounded value first; in-range values use round-to-nearest, ties-to-even.
+    function [32:0] depth_round_saturate;
+        input signed [79:0] numerator;
+        input [6:0] shift;
+
+        reg [79:0] magnitude;
+        reg [79:0] limit;
+        reg [79:0] rounded;
+        reg        ov;
+        begin
+            magnitude = numerator[79] ? (~numerator + 80'd1) : numerator;
+            if (numerator[79]) limit = 80'd2147483648;
+            else              limit = 80'd2147483647;
+            if (shift != 0) limit = limit << shift;
+            ov = (magnitude > limit);
+            if (ov) begin
+                if (numerator[79])
+                    depth_round_saturate = {1'b1, 32'h80000000};
+                else
+                    depth_round_saturate = {1'b1, 32'h7fffffff};
+            end else begin
+                rounded = round_shift_even(numerator, shift);
+                depth_round_saturate = {1'b0, rounded[31:0]};
+            end
+        end
+    endfunction
+
+    reg signed [71:0] r2_prod_nx, r2_prod_ny;
+    reg signed [79:0] r2_nx_scaled, r2_ny_scaled;
+    reg        [6:0]  r2_depth_shift;
+    reg        [32:0] r2_za_conv, r2_zb_conv;
+    reg signed [49:0] r2_za_x0, r2_zb_y0;
+    reg signed [50:0] r2_zc_q16;
+    reg signed [79:0] r2_zc_numerator;
+    reg        [32:0] r2_zc_conv;
+
+    always @* begin
+        // inv_m is Q1.17. Nx/D followed by Q8 output scaling gives a total
+        // right shift of (e + 9) for the Nx_raw * inv_m_raw product.
+        r2_prod_nx = $signed({{19{r2_nx[52]}},r2_nx}) *
+                     $signed({{54{1'b0}},r2_inv_m});
+        r2_prod_ny = $signed({{19{r2_ny[52]}},r2_ny}) *
+                     $signed({{54{1'b0}},r2_inv_m});
+        r2_nx_scaled = {{8{r2_prod_nx[71]}}, r2_prod_nx};
+        r2_ny_scaled = {{8{r2_prod_ny[71]}}, r2_prod_ny};
+        if (r2_d_neg) begin
+            r2_nx_scaled = -r2_nx_scaled;
+            r2_ny_scaled = -r2_ny_scaled;
+        end
+        r2_depth_shift = {1'b0, r2_exp} + 7'd9;
+
+        if (r2_degenerate) begin
+            r2_za_conv = {1'b0, 32'd0};
+            r2_zb_conv = {1'b0, 32'd0};
+        end else begin
+            r2_za_conv = depth_round_saturate(r2_nx_scaled, r2_depth_shift);
+            r2_zb_conv = depth_round_saturate(r2_ny_scaled, r2_depth_shift);
+        end
+
+        // zC is formed from the exact represented zA/zB values that will be
+        // output. Products are Q16; z0 is aligned to Q16 before subtraction.
+        r2_za_x0 = $signed({{18{r2_za_conv[31]}},r2_za_conv[31:0]}) *
+                   $signed({{32{r2_x0[17]}},r2_x0});
+        r2_zb_y0 = $signed({{18{r2_zb_conv[31]}},r2_zb_conv[31:0]}) *
+                   $signed({{32{r2_y0[17]}},r2_y0});
+        r2_zc_q16 = $signed({{11{r2_z0[31]}}, r2_z0, 8'b0}) -
+                    $signed({r2_za_x0[49], r2_za_x0}) -
+                    $signed({r2_zb_y0[49], r2_zb_y0});
+        r2_zc_numerator = {{29{r2_zc_q16[50]}}, r2_zc_q16};
+        if (r2_degenerate)
+            r2_zc_conv = {1'b0, 32'd0};
+        else
+            r2_zc_conv = depth_round_saturate(r2_zc_numerator, 7'd8);
+    end
+
+    // -------------------------------------------------------------------------
+    // Stage R3 output registers and status alignment
+    // -------------------------------------------------------------------------
+    reg r3_valid;
+    assign out_valid = r3_valid;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            r3_valid <= 1'b0;
+            overflow <= 1'b0;
             overflow_xy_range <= 1'b0;
-            overflow_edge_c   <= 1'b0;
-            overflow_zA       <= 1'b0;
-            overflow_zB       <= 1'b0;
-            overflow_zC       <= 1'b0;
-            overflow_depth    <= 1'b0;
-            bbox_clamped      <= 1'b0;
-            orient_neg        <= 1'b0;
-            degenerate        <= 1'b0;
-        end else if (pipe_advance && v[LATENCY-1]) begin
-            overflow_xy_range <= s9_xy_bad;
-            overflow_edge_c   <= s9_edge_c_ov;
-            overflow_zA       <= s9_ova;
-            overflow_zB       <= s9_ovb;
-            overflow_zC       <= s9_zc[32];
-            overflow_depth    <= s9_ova | s9_ovb | s9_zc[32];
-            overflow          <= s9_xy_bad | s9_edge_c_ov |
-                                 s9_ova | s9_ovb | s9_zc[32];
-            bbox_clamped      <= s9_bbox_clamped;
-            orient_neg        <= s9_dneg && !s9_degen;
-            degenerate        <= s9_degen;
+            overflow_edge_c <= 1'b0;
+            overflow_zA <= 1'b0;
+            overflow_zB <= 1'b0;
+            overflow_zC <= 1'b0;
+            overflow_depth <= 1'b0;
+            bbox_clamped <= 1'b0;
+            orient_neg <= 1'b0;
+            degenerate <= 1'b0;
+        end else if (pipe_advance) begin
+            r3_valid <= r2_valid;
+            if (r2_valid) begin
+                bbox_xmin <= r2_bbox_xmin;
+                bbox_xmax <= r2_bbox_xmax;
+                bbox_ymin <= r2_bbox_ymin;
+                bbox_ymax <= r2_bbox_ymax;
+
+                edge0_A <= r2_e0_a; edge0_B <= r2_e0_b; edge0_C <= r2_e0_c;
+                edge1_A <= r2_e1_a; edge1_B <= r2_e1_b; edge1_C <= r2_e1_c;
+                edge2_A <= r2_e2_a; edge2_B <= r2_e2_b; edge2_C <= r2_e2_c;
+
+                zA <= r2_za_conv[31:0];
+                zB <= r2_zb_conv[31:0];
+                zC <= r2_zc_conv[31:0];
+                face_color <= r2_color;
+                overflow_xy_range <= r2_xy_range_bad;
+                overflow_edge_c <= r2_edge_c_overflow;
+                overflow_zA <= r2_za_conv[32];
+                overflow_zB <= r2_zb_conv[32];
+                overflow_zC <= r2_zc_conv[32];
+                overflow_depth <= r2_za_conv[32] | r2_zb_conv[32] | r2_zc_conv[32];
+                overflow <= r2_xy_range_bad | r2_edge_c_overflow |
+                            r2_za_conv[32] | r2_zb_conv[32] | r2_zc_conv[32];
+                bbox_clamped <= r2_bbox_clamped;
+                orient_neg <= r2_d_neg && !r2_degenerate;
+                degenerate <= r2_degenerate;
+            end
         end
     end
 
