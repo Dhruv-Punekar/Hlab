@@ -305,20 +305,19 @@ module triangle_setup_unit_debug #(
         recip_address = d_normalized[37:28];
     end
 
-    reg [17:0] recip_rom [0:1023];
+    (* rom_style = "block" *) reg [17:0] recip_rom [0:1023];
     reg [17:0] recip_rom_q;
     initial begin
         $readmemh(RECIP_LUT_FILE, recip_rom);
     end
 
-    // Synchronous ROM read; CE follows the global pipeline advance.
+    // Synchronous ROM read; CE follows the global pipeline advance. The read
+    // is unconditional: a data-dependent "else 0" acts like a reset on the
+    // output register and can prevent RAMB18 inference. D == 0 is handled by
+    // r2_degenerate, which forces zA/zB/zC to zero.
     always @(posedge clk) begin
-        if (pipe_advance) begin
-            if (r1_valid && (r1_d != 0))
-                recip_rom_q <= recip_rom[recip_address];
-            else
-                recip_rom_q <= 18'd0;
-        end
+        if (pipe_advance)
+            recip_rom_q <= recip_rom[recip_address];
     end
 
     // -------------------------------------------------------------------------
