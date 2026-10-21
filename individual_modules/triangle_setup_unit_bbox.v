@@ -7,9 +7,11 @@
 //   * Q24.8 depth plane z(x,y) = zA*x + zB*y + zC
 //   * shared RGB565 color and status flags
 //
-// Outputs are BIT-IDENTICAL to rev A (same LUT, same rounding/saturation,
-// same flags; verified on 4000 random + corner-case triangles under random
-// backpressure). What changed is the micro-architecture:
+// With RECIP_NR=0 the outputs are BIT-IDENTICAL to rev A (same LUT, same
+// rounding/saturation, same flags; verified on 4000 random + corner-case
+// triangles under random backpressure). RECIP_NR=1 (default) adds one
+// Newton-Raphson step to the reciprocal; everything else is unchanged.
+// What changed is the micro-architecture:
 //
 //   rev A: 4 register stages; the last stage chained a 53x18 multiply, an
 //          80-bit negate, an 80-bit variable shifter, round/saturate, a 32x18
@@ -25,8 +27,10 @@
 //   S3  D, Nx, Ny, edge C (DSP48 PREG)   S9  zA*x0, zB*y0
 //   S4  |D| leading-one normalize        S10 zC round/saturate -> output regs
 //   S5  reciprocal BRAM read (registered)
+//   N1..N4 (RECIP_NR=1 only) Newton-Raphson refinement of 1/|D|
 //
-// Unstalled latency: input accepted on edge k -> out_valid after edge k+10.
+// Unstalled latency: input accepted on edge k -> out_valid after edge
+// k+10 (RECIP_NR=0) or k+14 (RECIP_NR=1). Use the LATENCY localparam.
 // Backpressure: global stall (all stages + BRAM CE freeze together).
 //
 // Reset: rst_n is asynchronous active-low as before, but ONLY valid bits and
@@ -36,7 +40,11 @@
 // synchronizer (async assert, sync de-assert) at the top level.
 // -----------------------------------------------------------------------------
 module triangle_setup_unit_debug #(
-    parameter RECIP_LUT_FILE = "recip_lut_q1_17.mem"
+    parameter RECIP_LUT_FILE = "recip_lut_q1_17.mem",
+    // 1: one Newton-Raphson step refines the 10-bit LUT seed (rel. error
+    //    ~2^-11 -> ~2^-17), +4 cycles latency, +2 DSP48E1.
+    // 0: rev-A numerics exactly (LUT seed used directly).
+    parameter RECIP_NR       = 1
 ) (
     input wire                     clk,
     input wire                     rst_n,          // asynchronous active-low
@@ -82,7 +90,8 @@ module triangle_setup_unit_debug #(
     output reg                     degenerate
 );
 
-    localparam integer LATENCY   = 10;            // edges from accept to out_valid
+    localparam integer NR_ST     = RECIP_NR ? 4 : 0;
+    localparam integer LATENCY   = 10 + NR_ST;    // edges from accept to out_valid
     localparam signed [31:0] X_MAX_Q8 = 32'sd76800;   // 300.0 in Q24.8
     localparam signed [31:0] Y_MAX_Q8 = 32'sd102400;  // 400.0 in Q24.8
     localparam integer X_PIX_MAX = 299;
@@ -344,6 +353,7 @@ module triangle_setup_unit_debug #(
     end
 
     reg [9:0]         s4_addr;
+    reg [24:0]        s4_mant;             // |D| mantissa, Q1.24
     reg [6:0]         s4_shift;            // e + 9
     reg               s4_dneg, s4_degen;
     reg signed [52:0] s4_nx, s4_ny;
@@ -360,6 +370,7 @@ module triangle_setup_unit_debug #(
     always @(posedge clk) begin
         if (pipe_advance) begin
             s4_addr  <= s3_dnorm[37:28];
+            s4_mant  <= s3_dnorm[38:14];
             s4_shift <= {1'b0, s3_dexp} + 7'd9;
             s4_dneg  <= s3_d[38];
             s4_degen <= (s3_d == 39'sd0);
@@ -390,6 +401,7 @@ module triangle_setup_unit_debug #(
     always @(posedge clk)
         if (pipe_advance) s5_inv <= recip_rom[s4_addr];
 
+    reg [24:0]        s5_mant;
     reg [6:0]         s5_shift;
     reg               s5_dneg, s5_degen;
     reg signed [52:0] s5_nx, s5_ny;
@@ -405,6 +417,7 @@ module triangle_setup_unit_debug #(
 
     always @(posedge clk) begin
         if (pipe_advance) begin
+            s5_mant  <= s4_mant;
             s5_shift <= s4_shift; s5_dneg <= s4_dneg; s5_degen <= s4_degen;
             s5_nx <= s4_nx; s5_ny <= s4_ny;
             s5_e0c <= s4_e0c; s5_e1c <= s4_e1c; s5_e2c <= s4_e2c;
@@ -422,12 +435,68 @@ module triangle_setup_unit_debug #(
     end
 
     // =========================================================================
+    // Optional reciprocal refinement (Newton-Raphson, one iteration)
+    //   r1 = r0 * (2 - m*r0),   m = |D| mantissa Q1.24, r0 = LUT seed Q1.17
+    //   N1: t = m*r0 (Q2.41)        N2: e = round(2 - t) as Q1.24
+    //   N3: p = r0*e (Q2.41)        N4: r1 = round(p) as Q1.17  (<= 1.0)
+    // Each multiply is 25x18 -> exactly one DSP48E1. The rest of the S5
+    // payload is carried alongside in a plain delay line.
+    // =========================================================================
+    localparam integer PW = 7+1+1+53+53+3*34+1+6*18+4*10+1+18+18+32+16+1;
+    wire [PW-1:0] s5_pay = {s5_shift, s5_dneg, s5_degen, s5_nx, s5_ny,
+                            s5_e0c, s5_e1c, s5_e2c, s5_edge_c_ov,
+                            s5_e0a, s5_e0b, s5_e1a, s5_e1b, s5_e2a, s5_e2b,
+                            s5_bxmin, s5_bxmax, s5_bymin, s5_bymax, s5_bbox_clamped,
+                            s5_x0, s5_y0, s5_z0, s5_color, s5_xy_bad};
+    wire [PW-1:0] n_pay;
+    wire [17:0]   n_inv;
+
+    generate
+        if (RECIP_NR) begin : g_nr
+            reg [42:0]    n1_t;  reg [17:0] n1_r0;
+            reg [24:0]    n2_e;  reg [17:0] n2_r0;
+            reg [42:0]    n3_p;
+            reg [17:0]    n4_r;
+            reg [PW-1:0]  p1, p2, p3, p4;
+            wire [42:0]   n1_e_full = 43'h400_0000_0000 - n1_t;          // 2.0 - t
+            wire [42:0]   n3_rnd    = n3_p + 43'd8388608;                 // + 2^23
+            always @(posedge clk) begin
+                if (pipe_advance) begin
+                    n1_t  <= s5_mant * s5_inv;    n1_r0 <= s5_inv;  p1 <= s5_pay;
+                    n2_e  <= (n1_e_full + 43'd65536) >> 17;         n2_r0 <= n1_r0; p2 <= p1;
+                    n3_p  <= n2_r0 * n2_e;                                         p3 <= p2;
+                    n4_r  <= n3_rnd[41:24];                                        p4 <= p3;
+                end
+            end
+            assign n_pay = p4;
+            assign n_inv = n4_r;
+        end else begin : g_lut_only
+            assign n_pay = s5_pay;
+            assign n_inv = s5_inv;
+        end
+    endgenerate
+
+    wire [6:0]         n_shift;
+    wire               n_dneg, n_degen, n_edge_c_ov, n_bbox_clamped, n_xy_bad;
+    wire signed [52:0] n_nx, n_ny;
+    wire signed [33:0] n_e0c, n_e1c, n_e2c;
+    wire signed [17:0] n_e0a, n_e0b, n_e1a, n_e1b, n_e2a, n_e2b, n_x0, n_y0;
+    wire        [9:0]  n_bxmin, n_bxmax, n_bymin, n_bymax;
+    wire signed [31:0] n_z0;
+    wire        [15:0] n_color;
+    assign {n_shift, n_dneg, n_degen, n_nx, n_ny,
+            n_e0c, n_e1c, n_e2c, n_edge_c_ov,
+            n_e0a, n_e0b, n_e1a, n_e1b, n_e2a, n_e2b,
+            n_bxmin, n_bxmax, n_bymin, n_bymax, n_bbox_clamped,
+            n_x0, n_y0, n_z0, n_color, n_xy_bad} = n_pay;
+
+    // =========================================================================
     // S6: N * (+/-inv_m). Folding sign(D) into the 19-bit multiplier operand
     // replaces rev A's 80-bit post-multiply negation; result is identical
     // because Nx*(-inv) == -(Nx*inv) exactly.
     // =========================================================================
-    wire signed [18:0] s5_inv_s = s5_dneg ? -$signed({1'b0, s5_inv})
-                                          :  $signed({1'b0, s5_inv});
+    wire signed [18:0] n_inv_s = n_dneg ? -$signed({1'b0, n_inv})
+                                          :  $signed({1'b0, n_inv});
 
     reg signed [71:0] s6_pa, s6_pb;
     reg [6:0]         s6_shift;
@@ -444,20 +513,20 @@ module triangle_setup_unit_debug #(
 
     always @(posedge clk) begin
         if (pipe_advance) begin
-            s6_pa <= s5_nx * s5_inv_s;
-            s6_pb <= s5_ny * s5_inv_s;
-            s6_shift <= s5_shift; s6_dneg <= s5_dneg; s6_degen <= s5_degen;
-            s6_e0c <= s5_e0c; s6_e1c <= s5_e1c; s6_e2c <= s5_e2c;
-            s6_edge_c_ov <= s5_edge_c_ov;
-            s6_e0a <= s5_e0a; s6_e0b <= s5_e0b;
-            s6_e1a <= s5_e1a; s6_e1b <= s5_e1b;
-            s6_e2a <= s5_e2a; s6_e2b <= s5_e2b;
-            s6_bxmin <= s5_bxmin; s6_bxmax <= s5_bxmax;
-            s6_bymin <= s5_bymin; s6_bymax <= s5_bymax;
-            s6_bbox_clamped <= s5_bbox_clamped;
-            s6_x0 <= s5_x0; s6_y0 <= s5_y0; s6_z0 <= s5_z0;
-            s6_color  <= s5_color;
-            s6_xy_bad <= s5_xy_bad;
+            s6_pa <= n_nx * n_inv_s;
+            s6_pb <= n_ny * n_inv_s;
+            s6_shift <= n_shift; s6_dneg <= n_dneg; s6_degen <= n_degen;
+            s6_e0c <= n_e0c; s6_e1c <= n_e1c; s6_e2c <= n_e2c;
+            s6_edge_c_ov <= n_edge_c_ov;
+            s6_e0a <= n_e0a; s6_e0b <= n_e0b;
+            s6_e1a <= n_e1a; s6_e1b <= n_e1b;
+            s6_e2a <= n_e2a; s6_e2b <= n_e2b;
+            s6_bxmin <= n_bxmin; s6_bxmax <= n_bxmax;
+            s6_bymin <= n_bymin; s6_bymax <= n_bymax;
+            s6_bbox_clamped <= n_bbox_clamped;
+            s6_x0 <= n_x0; s6_y0 <= n_y0; s6_z0 <= n_z0;
+            s6_color  <= n_color;
+            s6_xy_bad <= n_xy_bad;
         end
     end
 
