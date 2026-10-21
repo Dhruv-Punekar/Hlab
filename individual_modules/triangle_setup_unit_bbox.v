@@ -120,14 +120,23 @@ module triangle_setup_unit_debug #(
         end
     endfunction
 
+    // Control (valid + flags) keeps the asynchronous reset. Datapath registers
+    // have no reset so Vivado can pack them into DSP48E1 / RAMB18 registers,
+    // which only support synchronous reset; outputs are qualified by valid.
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             r0_valid <= 1'b0;
             r0_xy_range_bad <= 1'b0;
         end else if (pipe_advance) begin
             r0_valid <= in_valid;
-            if (in_valid) begin
+            if (in_valid)
                 r0_xy_range_bad <= input_xy_range_bad;
+        end
+    end
+
+    always @(posedge clk) begin
+        if (pipe_advance) begin
+            if (in_valid) begin
                 r0_x0   <= clamp_input_x(in_x0);
                 r0_y0   <= clamp_input_y(in_y0);
                 r0_x1   <= clamp_input_x(in_x1);
@@ -240,6 +249,20 @@ module triangle_setup_unit_debug #(
         end else if (pipe_advance) begin
             r1_valid <= r0_valid;
             if (r0_valid) begin
+                r1_xy_range_bad <= r0_xy_range_bad;
+                // A signed 37-bit C is representable in signed 34 bits only
+                // when its three discarded upper bits repeat bit 33.
+                r1_edge_c_overflow <=
+                    (r0_e0_c[36:34] != {3{r0_e0_c[33]}}) ||
+                    (r0_e1_c[36:34] != {3{r0_e1_c[33]}}) ||
+                    (r0_e2_c[36:34] != {3{r0_e2_c[33]}});
+            end
+        end
+    end
+
+    always @(posedge clk) begin
+        if (pipe_advance) begin
+            if (r0_valid) begin
                 r1_d       <= r0_d_calc;
                 r1_nx      <= r0_nx_calc;
                 r1_ny      <= r0_ny_calc;
@@ -253,13 +276,6 @@ module triangle_setup_unit_debug #(
                 r1_x0      <= r0_x0;   r1_y0   <= r0_y0;
                 r1_z0      <= r0_z0;
                 r1_color   <= r0_color;
-                r1_xy_range_bad <= r0_xy_range_bad;
-                // A signed 37-bit C is representable in signed 34 bits only
-                // when its three discarded upper bits repeat bit 33.
-                r1_edge_c_overflow <=
-                    (r0_e0_c[36:34] != {3{r0_e0_c[33]}}) ||
-                    (r0_e1_c[36:34] != {3{r0_e1_c[33]}}) ||
-                    (r0_e2_c[36:34] != {3{r0_e2_c[33]}});
             end
         end
     end
@@ -405,6 +421,17 @@ module triangle_setup_unit_debug #(
         end else if (pipe_advance) begin
             r2_valid <= r1_valid;
             if (r1_valid) begin
+                r2_xy_range_bad <= r1_xy_range_bad;
+                r2_edge_c_overflow <= r1_edge_c_overflow;
+                r2_bbox_clamped <= bbox_clamp_needed_x(r1_xmin_raw, r1_xmax_raw) |
+                                   bbox_clamp_needed_y(r1_ymin_raw, r1_ymax_raw);
+            end
+        end
+    end
+
+    always @(posedge clk) begin
+        if (pipe_advance) begin
+            if (r1_valid) begin
                 r2_bbox_xmin <= bbox_floor_clamp_x(r1_xmin_raw);
                 r2_bbox_xmax <= bbox_ceil_clamp_x (r1_xmax_raw);
                 r2_bbox_ymin <= bbox_floor_clamp_y(r1_ymin_raw);
@@ -431,10 +458,6 @@ module triangle_setup_unit_debug #(
                 r2_exp       <= d_exponent;
                 r2_d_neg     <= r1_d[38];
                 r2_degenerate<= (r1_d == 0);
-                r2_xy_range_bad <= r1_xy_range_bad;
-                r2_edge_c_overflow <= r1_edge_c_overflow;
-                r2_bbox_clamped <= bbox_clamp_needed_x(r1_xmin_raw, r1_xmax_raw) |
-                                   bbox_clamp_needed_y(r1_ymin_raw, r1_ymax_raw);
             end
         end
     end
@@ -573,6 +596,24 @@ module triangle_setup_unit_debug #(
         end else if (pipe_advance) begin
             r3_valid <= r2_valid;
             if (r2_valid) begin
+                overflow_xy_range <= r2_xy_range_bad;
+                overflow_edge_c <= r2_edge_c_overflow;
+                overflow_zA <= r2_za_conv[32];
+                overflow_zB <= r2_zb_conv[32];
+                overflow_zC <= r2_zc_conv[32];
+                overflow_depth <= r2_za_conv[32] | r2_zb_conv[32] | r2_zc_conv[32];
+                overflow <= r2_xy_range_bad | r2_edge_c_overflow |
+                            r2_za_conv[32] | r2_zb_conv[32] | r2_zc_conv[32];
+                bbox_clamped <= r2_bbox_clamped;
+                orient_neg <= r2_d_neg && !r2_degenerate;
+                degenerate <= r2_degenerate;
+            end
+        end
+    end
+
+    always @(posedge clk) begin
+        if (pipe_advance) begin
+            if (r2_valid) begin
                 bbox_xmin <= r2_bbox_xmin;
                 bbox_xmax <= r2_bbox_xmax;
                 bbox_ymin <= r2_bbox_ymin;
@@ -586,17 +627,6 @@ module triangle_setup_unit_debug #(
                 zB <= r2_zb_conv[31:0];
                 zC <= r2_zc_conv[31:0];
                 face_color <= r2_color;
-                overflow_xy_range <= r2_xy_range_bad;
-                overflow_edge_c <= r2_edge_c_overflow;
-                overflow_zA <= r2_za_conv[32];
-                overflow_zB <= r2_zb_conv[32];
-                overflow_zC <= r2_zc_conv[32];
-                overflow_depth <= r2_za_conv[32] | r2_zb_conv[32] | r2_zc_conv[32];
-                overflow <= r2_xy_range_bad | r2_edge_c_overflow |
-                            r2_za_conv[32] | r2_zb_conv[32] | r2_zc_conv[32];
-                bbox_clamped <= r2_bbox_clamped;
-                orient_neg <= r2_d_neg && !r2_degenerate;
-                degenerate <= r2_degenerate;
             end
         end
     end
