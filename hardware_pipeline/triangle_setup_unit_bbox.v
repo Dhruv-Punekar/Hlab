@@ -18,19 +18,20 @@
 //          multiply, a 3-input 51-bit add and a second round/saturate in ONE
 //          clock. On an Artix-7 (-1/-2) that path is several times longer than
 //          a 10 ns (100 MHz) period.
-//   rev B: 11 register stages (S0..S10), every stage holds at most one
+//   rev B: 12 register stages (S0..S10 + S3M), each holds at most one
 //          multiply OR one shifter OR one carry chain. II is still 1.
 //
 //   S0  capture + range clamp            S6  Nx*inv, Ny*inv (sign folded in inv)
 //   S1  differences, bbox min/max        S7  |p| >> (e+9), guard/sticky
 //   S2  all products (DSP48 MREG)        S8  overflow test, round, saturate zA/zB
 //   S3  D, Nx, Ny, edge C (DSP48 PREG)   S9  zA*x0, zB*y0
-//   S4  |D| leading-one normalize        S10 zC round/saturate -> output regs
+//   S3M |D| (negate) registered          S10 zC round/saturate -> output regs
+//   S4  leading-one detect + normalize
 //   S5  reciprocal BRAM read (registered)
 //   N1..N4 (RECIP_NR=1 only) Newton-Raphson refinement of 1/|D|
 //
 // Unstalled latency: input accepted on edge k -> out_valid after edge
-// k+10 (RECIP_NR=0) or k+14 (RECIP_NR=1). Use the LATENCY localparam.
+// k+11 (RECIP_NR=0) or k+15 (RECIP_NR=1). Use the LATENCY localparam.
 // Backpressure: global stall (all stages + BRAM CE freeze together).
 //
 // Reset: rst_n is asynchronous active-low as before, but ONLY valid bits and
@@ -91,7 +92,7 @@ module triangle_setup_unit_debug #(
 );
 
     localparam integer NR_ST     = RECIP_NR ? 4 : 0;
-    localparam integer LATENCY   = 10 + NR_ST;    // edges from accept to out_valid
+    localparam integer LATENCY   = 11 + NR_ST;    // edges from accept to out_valid
     localparam signed [31:0] X_MAX_Q8 = 32'sd76800;   // 300.0 in Q24.8
     localparam signed [31:0] Y_MAX_Q8 = 32'sd102400;  // 400.0 in Q24.8
     localparam integer X_PIX_MAX = 299;
@@ -338,18 +339,54 @@ module triangle_setup_unit_debug #(
     end
 
     // =========================================================================
-    // S4: |D| leading-one detect and normalize -> ROM address
+    // S3M: |D| (39-bit negate) registered on its own. Doing the negate, the
+    // leading-one detect and the normalize shift in one cycle before the
+    // BRAM address pin failed 100 MHz on xc7a100t-1 (WNS -0.70 ns).
     // =========================================================================
-    reg [38:0] s3_dmag;
-    reg [5:0]  s3_dexp;
-    reg [38:0] s3_dnorm;
+    reg        [38:0] m_dmag;
+    reg               m_dneg, m_degen;
+    reg signed [52:0] m_nx, m_ny;
+    reg signed [33:0] m_e0c, m_e1c, m_e2c;
+    reg               m_edge_c_ov;
+    reg signed [17:0] m_e0a, m_e0b, m_e1a, m_e1b, m_e2a, m_e2b;
+    reg        [9:0]  m_bxmin, m_bxmax, m_bymin, m_bymax;
+    reg               m_bbox_clamped;
+    reg signed [17:0] m_x0, m_y0;
+    reg signed [31:0] m_z0;
+    reg        [15:0] m_color;
+    reg               m_xy_bad;
+
+    always @(posedge clk) begin
+        if (pipe_advance) begin
+            m_dmag  <= s3_d[38] ? (~s3_d + 39'd1) : s3_d;
+            m_dneg  <= s3_d[38];
+            m_degen <= (s3_d == 39'sd0);
+            m_nx <= s3_nx;  m_ny <= s3_ny;
+            m_e0c <= s3_e0c; m_e1c <= s3_e1c; m_e2c <= s3_e2c;
+            m_edge_c_ov <= s3_edge_c_ov;
+            m_e0a <= s3_e0a; m_e0b <= s3_e0b;
+            m_e1a <= s3_e1a; m_e1b <= s3_e1b;
+            m_e2a <= s3_e2a; m_e2b <= s3_e2b;
+            m_bxmin <= s3_bxmin; m_bxmax <= s3_bxmax;
+            m_bymin <= s3_bymin; m_bymax <= s3_bymax;
+            m_bbox_clamped <= s3_bbox_clamped;
+            m_x0 <= s3_x0; m_y0 <= s3_y0; m_z0 <= s3_z0;
+            m_color  <= s3_color;
+            m_xy_bad <= s3_xy_bad;
+        end
+    end
+
+    // =========================================================================
+    // S4: leading-one detect and normalize |D| -> ROM address
+    // =========================================================================
+    reg [5:0]  m_dexp;
+    reg [38:0] m_dnorm;
     integer    nb;
     always @* begin
-        s3_dmag = s3_d[38] ? (~s3_d + 39'd1) : s3_d;
-        s3_dexp = 6'd0;
+        m_dexp = 6'd0;
         for (nb = 0; nb < 39; nb = nb + 1)
-            if (s3_dmag[nb]) s3_dexp = nb[5:0];
-        s3_dnorm = s3_dmag << (6'd38 - s3_dexp);
+            if (m_dmag[nb]) m_dexp = nb[5:0];
+        m_dnorm = m_dmag << (6'd38 - m_dexp);
     end
 
     reg [9:0]         s4_addr;
@@ -369,23 +406,23 @@ module triangle_setup_unit_debug #(
 
     always @(posedge clk) begin
         if (pipe_advance) begin
-            s4_addr  <= s3_dnorm[37:28];
-            s4_mant  <= s3_dnorm[38:14];
-            s4_shift <= {1'b0, s3_dexp} + 7'd9;
-            s4_dneg  <= s3_d[38];
-            s4_degen <= (s3_d == 39'sd0);
-            s4_nx <= s3_nx;  s4_ny <= s3_ny;
-            s4_e0c <= s3_e0c; s4_e1c <= s3_e1c; s4_e2c <= s3_e2c;
-            s4_edge_c_ov <= s3_edge_c_ov;
-            s4_e0a <= s3_e0a; s4_e0b <= s3_e0b;
-            s4_e1a <= s3_e1a; s4_e1b <= s3_e1b;
-            s4_e2a <= s3_e2a; s4_e2b <= s3_e2b;
-            s4_bxmin <= s3_bxmin; s4_bxmax <= s3_bxmax;
-            s4_bymin <= s3_bymin; s4_bymax <= s3_bymax;
-            s4_bbox_clamped <= s3_bbox_clamped;
-            s4_x0 <= s3_x0; s4_y0 <= s3_y0; s4_z0 <= s3_z0;
-            s4_color  <= s3_color;
-            s4_xy_bad <= s3_xy_bad;
+            s4_addr  <= m_dnorm[37:28];
+            s4_mant  <= m_dnorm[38:14];
+            s4_shift <= {1'b0, m_dexp} + 7'd9;
+            s4_dneg  <= m_dneg;
+            s4_degen <= m_degen;
+            s4_nx <= m_nx;  s4_ny <= m_ny;
+            s4_e0c <= m_e0c; s4_e1c <= m_e1c; s4_e2c <= m_e2c;
+            s4_edge_c_ov <= m_edge_c_ov;
+            s4_e0a <= m_e0a; s4_e0b <= m_e0b;
+            s4_e1a <= m_e1a; s4_e1b <= m_e1b;
+            s4_e2a <= m_e2a; s4_e2b <= m_e2b;
+            s4_bxmin <= m_bxmin; s4_bxmax <= m_bxmax;
+            s4_bymin <= m_bymin; s4_bymax <= m_bymax;
+            s4_bbox_clamped <= m_bbox_clamped;
+            s4_x0 <= m_x0; s4_y0 <= m_y0; s4_z0 <= m_z0;
+            s4_color  <= m_color;
+            s4_xy_bad <= m_xy_bad;
         end
     end
 
