@@ -2,32 +2,38 @@
 
 // ============================================================================
 // Module: z_f_buffer
-// Purpose: Combined Z-Buffer and Framebuffer with a 3-stage pipeline, 
-//          data forwarding, and fast-clearing. 
+// Purpose: Combined Z-Buffer and Framebuffer with a 3-stage pipeline,
+//          data forwarding, and fast-clearing.
 //          (Single Buffered architecture: 300x400 fits perfectly in BRAM)
+//
+// Depth format: pixel_z is SIGNED Q12.4 (rasterizer Z_SIGNED=1, NDC depth,
+//               smaller = nearer). All depth compares are signed and the
+//               z-buffer clears to +32767 (0x7FFF = farthest).
+//               Fix 2026-10-22: compares were unsigned with a 0xFFFF clear,
+//               so every negative (near) depth lost to every positive one.
 // ============================================================================
 module z_f_buffer #(
     parameter WIDTH = 300,
     parameter HEIGHT = 400,
     // Total pixels per buffer
-    parameter PIXELS = WIDTH * HEIGHT 
+    parameter PIXELS = WIDTH * HEIGHT
 )(
     // Rasterizer Clock Domain
     input  wire        clk_render,
     input  wire        rst_n,
-    
+
     // Rasterizer Interface
     input  wire        valid_in,
     input  wire [9:0]  pixel_x,
     input  wire [9:0]  pixel_y,
     input  wire [15:0] pixel_z,
     input  wire [15:0] pixel_color,
-    
+
     // Handshake & Status
     output wire        ready_out,   // Tells rasterizer we can accept pixels
     output wire        clear_done,  // High when memory wipe is finished
     output wire        busy,        // High during wipe
-    
+
     // VGA Clock Domain
     input  wire        clk_vga,
     input  wire [9:0]  vga_x,
@@ -47,13 +53,13 @@ module z_f_buffer #(
     // ========================================================================
     localparam STATE_CLEAR = 1'b0;
     localparam STATE_IDLE  = 1'b1;
-    
+
     reg state;
     reg [18:0] clear_addr; // Large enough to count to 120,000
 
     assign busy = (state == STATE_CLEAR);
     assign clear_done = (state == STATE_IDLE);
-    
+
     // We can only accept pixels if we are IDLE, bounds are correct, and valid is high
     wire bounds_ok = (pixel_x < WIDTH) && (pixel_y < HEIGHT);
     assign ready_out = (state == STATE_IDLE);
@@ -61,27 +67,30 @@ module z_f_buffer #(
     // ========================================================================
     // 3-STAGE PIPELINE (S1: Read, S2: Compare, S3: Write)
     // ========================================================================
-    
+
     // --- STAGE 1 REGISTERS ---
     reg s1_valid;
     reg [18:0] s1_addr;
-    reg [15:0] s1_z, s1_color;
-    
+    reg signed [15:0] s1_z;
+    reg        [15:0] s1_color;
+
     // --- STAGE 2 REGISTERS ---
     reg s2_valid;
     reg [18:0] s2_addr;
-    reg [15:0] s2_z, s2_color;
-    reg [15:0] s2_old_z; // From BRAM
-    
+    reg signed [15:0] s2_z;
+    reg        [15:0] s2_color;
+    reg signed [15:0] s2_old_z; // From BRAM
+
     // --- STAGE 3 REGISTERS ---
     reg s3_we;
     reg [18:0] s3_addr;
-    reg [15:0] s3_z, s3_color;
+    reg signed [15:0] s3_z;
+    reg        [15:0] s3_color;
 
     // --- STAGE 4 REGISTERS (Distance-2 RAW Hazard Bypass) ---
     reg s4_we;
     reg [18:0] s4_addr;
-    reg [15:0] s4_z;
+    reg signed [15:0] s4_z;
 
     // ========================================================================
     // PIPELINE EXECUTION
@@ -92,29 +101,29 @@ module z_f_buffer #(
             clear_addr <= 0;
             s1_valid <= 0; s2_valid <= 0; s3_we <= 0; s4_we <= 0;
         end else begin
-            
+
             // ----------------------------------------------------------------
             // FAST CLEAR FSM
             // ----------------------------------------------------------------
             if (state == STATE_CLEAR) begin
-                // Wipe both Z and Color memories 
-                z_buffer[clear_addr] <= 16'hFFFF; // Infinity
+                // Wipe both Z and Color memories
+                z_buffer[clear_addr] <= 16'sh7FFF; // Farthest signed depth (+2047.94)
                 frame_buffer[clear_addr] <= 16'h0000; // Black
-                
+
                 clear_addr <= clear_addr + 1;
-                
+
                 // Stop when we reach the end of the memory
                 if (clear_addr == PIXELS - 1) begin
                     state <= STATE_IDLE;
                 end
-                
+
                 s1_valid <= 0; s2_valid <= 0; s3_we <= 0; s4_we <= 0;
-            end 
+            end
             // ----------------------------------------------------------------
             // RENDER PIPELINE
             // ----------------------------------------------------------------
             else begin
-                
+
                 // ------------------------------------------------------------
                 // STAGE 1: READ
                 // ------------------------------------------------------------
@@ -131,9 +140,9 @@ module z_f_buffer #(
                 s2_z <= s1_z;
                 s2_color <= s1_color;
                 s2_valid <= s1_valid;
-                
+
                 // Synchronous BRAM Read (Fetching the old Z value)
-                s2_old_z <= z_buffer[s1_addr]; 
+                s2_old_z <= z_buffer[s1_addr];
 
                 // ------------------------------------------------------------
                 // STAGE 3: WRITE (With Distance-1 & Distance-2 Forwarding)
@@ -141,7 +150,7 @@ module z_f_buffer #(
                 s3_addr <= s2_addr;
                 s3_z <= s2_z;
                 s3_color <= s2_color;
-                
+
                 // Track committed write for Distance-2 hazard bypass
                 s4_we   <= s3_we;
                 s4_addr <= s3_addr;
@@ -152,11 +161,11 @@ module z_f_buffer #(
                 // Distance 2: Pixel in Stage 4 committed a write on the exact same
                 //             clock edge that Stage 2 sampled BRAM (stale read).
                 if (s3_we && (s3_addr == s2_addr)) begin
-                    s3_we <= s2_valid && (s2_z < s3_z);  // Distance-1 Forwarding
+                    s3_we <= s2_valid && (s2_z < s3_z);  // Distance-1 Forwarding (signed)
                 end else if (s4_we && (s4_addr == s2_addr)) begin
-                    s3_we <= s2_valid && (s2_z < s4_z);  // Distance-2 Forwarding
+                    s3_we <= s2_valid && (s2_z < s4_z);  // Distance-2 Forwarding (signed)
                 end else begin
-                    s3_we <= s2_valid && (s2_z < s2_old_z); // Normal BRAM Read
+                    s3_we <= s2_valid && (s2_z < s2_old_z); // Normal BRAM Read (signed)
                 end
 
                 // Execute the actual memory write
@@ -173,7 +182,7 @@ module z_f_buffer #(
     // ========================================================================
     wire [18:0] vga_addr_1d = (vga_y * WIDTH) + vga_x;
     wire vga_bounds_ok = (vga_x < WIDTH) && (vga_y < HEIGHT);
-    
+
     always @(posedge clk_vga) begin
         if (vga_bounds_ok)
             vga_color <= frame_buffer[vga_addr_1d];
