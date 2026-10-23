@@ -317,7 +317,7 @@ module hardware_pipeline #(
     // ========================================================================
     wire        zf_ready, zf_clear_done;
     wire [9:0]  vga_fb_x, vga_fb_y;
-    wire [15:0] vga_fb_color;
+    wire [11:0] vga_fb_color;
 
     z_f_buffer #(
         .WIDTH  (300),
