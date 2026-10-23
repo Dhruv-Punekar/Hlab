@@ -2,23 +2,23 @@
 
 // ============================================================================
 // Module: transform_engine
-// Purpose: Applies a 4x4 Transformation Matrix to a 3D vertex using a
+// Purpose: Applies a 4x4 Transformation Matrix to a 3D vertex using a 
 //          fully pipelined 3-stage DSP datapath. Uses Q24.8 Fixed-Point math.
 // Features: Handshaking (CE Stalls), Color Passthrough, Saturation logic.
 // ============================================================================
 module transform_engine (
     input  wire         clk,
     input  wire         rst_n,      // Active-low reset
-
+    
     // Handshake Signals
     input  wire         valid_in,   // High when Master FSM provides valid data
     output wire         ready_out,  // High when this module can accept new data
     input  wire         ready_in,   // High when Projection Engine can accept data
     output wire         valid_out,  // High when output math is finished
-
+    
     // Data Interfaces
     input  wire [143:0] vertex_in,  // Incoming Vertex {X, Y, Z, W, RGB565}
-    input  wire [511:0] matrix_in,  // 4x4 Matrix, element k=row*4+col at [k*32 +: 32]
+    input  wire [511:0] matrix_in,  // 4x4 Transformation Matrix (16x 32-bit)
     output wire [143:0] vertex_out  // Transformed Vertex {X', Y', Z', W', RGB565}
 );
 
@@ -30,9 +30,9 @@ module transform_engine (
     function signed [31:0] sat_trunc;
         input signed [63:0] prod;
         begin
-            if (prod[63] == 1'b0 && (|prod[62:39] == 1'b1))
+            if (prod[63] == 1'b0 && (|prod[62:39] == 1'b1)) 
                 sat_trunc = 32'h7FFF_FFFF; // Clamp to Max Positive
-            else if (prod[63] == 1'b1 && (~&prod[62:39] == 1'b1))
+            else if (prod[63] == 1'b1 && (~&prod[62:39] == 1'b1)) 
                 sat_trunc = 32'h8000_0000; // Clamp to Max Negative
             else
                 sat_trunc = prod[39:8];    // Normal Truncation
@@ -67,30 +67,25 @@ module transform_engine (
     wire        [15:0] in_C = vertex_in[15:0];
 
     // Extract Matrix Elements (Rows 0 to 3)
-    // FIX (matrix word order): matrix_memory flattens element k (row-major,
-    // k = row*4 + col, i.e. line k of matrix.mem) into matrix_in[k*32 +: 32].
-    // So M00 is in the LOWEST word [31:0] and M33 in the HIGHEST [511:480].
-    // (The previous mapping read the bus back-to-front, rotating the matrix
-    //  by 180 degrees: M[r][c] -> M[3-r][3-c].)
-    wire signed [31:0] M00 = $signed(matrix_in[ 0*32 +: 32]);
-    wire signed [31:0] M01 = $signed(matrix_in[ 1*32 +: 32]);
-    wire signed [31:0] M02 = $signed(matrix_in[ 2*32 +: 32]);
-    wire signed [31:0] M03 = $signed(matrix_in[ 3*32 +: 32]);
+    wire signed [31:0] M00 = $signed(matrix_in[511:480]);
+    wire signed [31:0] M01 = $signed(matrix_in[479:448]);
+    wire signed [31:0] M02 = $signed(matrix_in[447:416]);
+    wire signed [31:0] M03 = $signed(matrix_in[415:384]);
     
-    wire signed [31:0] M10 = $signed(matrix_in[ 4*32 +: 32]);
-    wire signed [31:0] M11 = $signed(matrix_in[ 5*32 +: 32]);
-    wire signed [31:0] M12 = $signed(matrix_in[ 6*32 +: 32]);
-    wire signed [31:0] M13 = $signed(matrix_in[ 7*32 +: 32]);
+    wire signed [31:0] M10 = $signed(matrix_in[383:352]);
+    wire signed [31:0] M11 = $signed(matrix_in[351:320]);
+    wire signed [31:0] M12 = $signed(matrix_in[319:288]);
+    wire signed [31:0] M13 = $signed(matrix_in[287:256]);
     
-    wire signed [31:0] M20 = $signed(matrix_in[ 8*32 +: 32]);
-    wire signed [31:0] M21 = $signed(matrix_in[ 9*32 +: 32]);
-    wire signed [31:0] M22 = $signed(matrix_in[10*32 +: 32]);
-    wire signed [31:0] M23 = $signed(matrix_in[11*32 +: 32]);
+    wire signed [31:0] M20 = $signed(matrix_in[255:224]);
+    wire signed [31:0] M21 = $signed(matrix_in[223:192]);
+    wire signed [31:0] M22 = $signed(matrix_in[191:160]);
+    wire signed [31:0] M23 = $signed(matrix_in[159:128]);
     
-    wire signed [31:0] M30 = $signed(matrix_in[12*32 +: 32]);
-    wire signed [31:0] M31 = $signed(matrix_in[13*32 +: 32]);
-    wire signed [31:0] M32 = $signed(matrix_in[14*32 +: 32]);
-    wire signed [31:0] M33 = $signed(matrix_in[15*32 +: 32]);
+    wire signed [31:0] M30 = $signed(matrix_in[127:96]);
+    wire signed [31:0] M31 = $signed(matrix_in[95:64]);
+    wire signed [31:0] M32 = $signed(matrix_in[63:32]);
+    wire signed [31:0] M33 = $signed(matrix_in[31:0]);
 
     // ========================================================================
     // PIPELINE REGISTERS
@@ -122,7 +117,7 @@ module transform_engine (
         if (!rst_n) begin
             val_stg1 <= 0; val_stg2 <= 0; val_stg3 <= 0;
         end else if (ready_in) begin
-
+            
             // Push Valid Flags & Color through pipeline
             val_stg1 <= valid_in;
             val_stg2 <= val_stg1;
@@ -145,13 +140,13 @@ module transform_engine (
             // ----------------------------------------------------------------
             sX_AB <= sat_add(sat_trunc(pX0), sat_trunc(pX1));
             sX_CD <= sat_add(sat_trunc(pX2), sat_trunc(pX3));
-
+            
             sY_AB <= sat_add(sat_trunc(pY0), sat_trunc(pY1));
             sY_CD <= sat_add(sat_trunc(pY2), sat_trunc(pY3));
-
+            
             sZ_AB <= sat_add(sat_trunc(pZ0), sat_trunc(pZ1));
             sZ_CD <= sat_add(sat_trunc(pZ2), sat_trunc(pZ3));
-
+            
             sW_AB <= sat_add(sat_trunc(pW0), sat_trunc(pW1));
             sW_CD <= sat_add(sat_trunc(pW2), sat_trunc(pW3));
 

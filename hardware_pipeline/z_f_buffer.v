@@ -5,11 +5,33 @@
 // Purpose: Combined Z-Buffer and Framebuffer with a 3-stage pipeline,
 //          data forwarding, and fast-clearing.
 //          (Single Buffered architecture: 300x400 fits perfectly in BRAM)
-// Depth  : pixel_z is SIGNED two's complement (e.g. rasterizer Q8.8 / Q12.4).
-//          Smaller = nearer. Buffer clears to +32767 (16'h7FFF) = farthest.
-//          All depth registers and the z_buffer RAM are signed, so every
-//          '<' compare below is a signed compare.
+//
+// Depth format: pixel_z is SIGNED (rasterizer Z_SIGNED=1, NDC depth, smaller
+//               = nearer; Q6.9 with Z_FRAC_OUT = 9). All depth compares are
+//               signed and the z-buffer clears to +32767 (0x7FFF = farthest).
+//               Fix 2026-10-22: compares were unsigned with a 0xFFFF clear,
+//               so every negative (near) depth lost to every positive one.
+//
+// BRAM inference (fix 2026-10-23): the memories are read and written ONLY in
+// the reset-free always blocks of section "MEMORY PORTS". Vivado cannot map a
+// memory written inside an always block with an asynchronous reset to block
+// RAM (Synth 8-4767 "RAM is sensitive to asynchronous reset signal" ->
+// Synth 8-3391). Clear and pixel writes now share one write port through a
+// mux; behaviour is cycle-for-cycle identical to the previous version.
+//
+// Timing fix (2026-10-23): the read address s1_addr was built inside a DSP48
+// block (y*300 + x) and one DSP output drove ~97 block-RAM address pins
+// across the chip (9.2 ns of wire -> 5 paths failed by up to 0.31 ns).
+// Now: use_dsp = "no" keeps the address arithmetic in normal logic, and
+// max_fanout lets Vivado make several copies of s1_addr, each placed close
+// to its own group of block RAMs. Same values, same clock cycle: behaviour
+// is unchanged.
+// Latch fix (2026-10-23): s1_addr is now written in its own always block
+// without a reset (it never had a reset value). Inside the async-reset block
+// Vivado built "hold during reset" for it out of 19 latches (TIMING-20,
+// PDRC-153). It still updates only when not clearing, exactly as before.
 // ============================================================================
+(* use_dsp = "no" *)   // address math in fabric so s1_addr can be replicated
 module z_f_buffer #(
     parameter WIDTH = 300,
     parameter HEIGHT = 400,
@@ -24,7 +46,7 @@ module z_f_buffer #(
     input  wire        valid_in,
     input  wire [9:0]  pixel_x,
     input  wire [9:0]  pixel_y,
-    input  wire signed [15:0] pixel_z,   // signed depth, smaller = nearer
+    input  wire [15:0] pixel_z,
     input  wire [15:0] pixel_color,
 
     // Handshake & Status
@@ -44,10 +66,7 @@ module z_f_buffer #(
     // ========================================================================
     // Explicitly enforce Xilinx Block RAM inference (RAMB36/RAMB18)
     (* ram_style = "block" *) reg [15:0] frame_buffer [0:PIXELS-1];
-    (* ram_style = "block" *) reg signed [15:0] z_buffer [0:PIXELS-1];
-
-    // Farthest representable signed depth (clear value)
-    localparam signed [15:0] Z_FAR = 16'sh7FFF;
+    (* ram_style = "block" *) reg [15:0] z_buffer     [0:PIXELS-1];
 
     // ========================================================================
     // FSM & FAST CLEAR LOGIC
@@ -71,7 +90,7 @@ module z_f_buffer #(
 
     // --- STAGE 1 REGISTERS ---
     reg s1_valid;
-    reg [18:0] s1_addr;
+    (* max_fanout = 16 *) reg [18:0] s1_addr;  // Vivado may duplicate this register (read-address fanout)
     reg signed [15:0] s1_z;
     reg        [15:0] s1_color;
 
@@ -107,9 +126,8 @@ module z_f_buffer #(
             // FAST CLEAR FSM
             // ----------------------------------------------------------------
             if (state == STATE_CLEAR) begin
-                // Wipe both Z and Color memories
-                z_buffer[clear_addr] <= Z_FAR;    // Infinity (max positive signed)
-                frame_buffer[clear_addr] <= 16'h0000; // Black
+                // Wipe both Z and Color memories (the writes themselves are in
+                // MEMORY PORTS below: z = 0x7FFF farthest, color = black)
 
                 clear_addr <= clear_addr + 1;
 
@@ -128,8 +146,8 @@ module z_f_buffer #(
                 // ------------------------------------------------------------
                 // STAGE 1: READ
                 // ------------------------------------------------------------
-                // Calculate 1D Memory Address
-                s1_addr <= (pixel_y * WIDTH) + pixel_x;
+                // (1D memory address s1_addr is computed in its own
+                //  reset-free block below, see "STAGE 1 ADDRESS")
                 s1_z <= pixel_z;
                 s1_color <= pixel_color;
                 s1_valid <= valid_in && bounds_ok; // MVP: Hardware Bounds Check
@@ -142,8 +160,7 @@ module z_f_buffer #(
                 s2_color <= s1_color;
                 s2_valid <= s1_valid;
 
-                // Synchronous BRAM Read (Fetching the old Z value)
-                s2_old_z <= z_buffer[s1_addr];
+                // (s2_old_z is the synchronous BRAM read, see MEMORY PORTS)
 
                 // ------------------------------------------------------------
                 // STAGE 3: WRITE (With Distance-1 & Distance-2 Forwarding)
@@ -169,13 +186,42 @@ module z_f_buffer #(
                     s3_we <= s2_valid && (s2_z < s2_old_z); // Normal BRAM Read (signed)
                 end
 
-                // Execute the actual memory write
-                if (s3_we) begin
-                    z_buffer[s3_addr] <= s3_z;
-                    frame_buffer[s3_addr] <= s3_color;
-                end
+                // (the memory write for s3_we is in MEMORY PORTS)
             end
         end
+    end
+
+    // ========================================================================
+    // MEMORY PORTS (no reset here, so Vivado infers block RAM)
+    //   one write port (render clock): fast clear OR the stage-3 pixel write
+    //   one read port  (render clock): z_buffer[s1_addr] -> s2_old_z
+    //   VGA read port  (VGA clock)   : frame_buffer, below
+    // Read-during-write on the same address returns the OLD value (read-first),
+    // exactly as before; the distance-2 forwarding path covers that case.
+    // ========================================================================
+    wire               clearing = (state == STATE_CLEAR);
+
+    // STAGE 1 ADDRESS: y * WIDTH + x. No reset (it never had one); updates on
+    // the same clock edges as the rest of stage 1 (only when not clearing).
+    always @(posedge clk_render) begin
+        if (!clearing)
+            s1_addr <= (pixel_y * WIDTH) + pixel_x;
+    end
+    wire               mem_we   = clearing | s3_we;      // s3_we is 0 during clear
+    wire [18:0]        mem_addr = clearing ? clear_addr : s3_addr;
+    wire signed [15:0] mem_z    = clearing ? 16'sh7FFF  : s3_z;    // 0x7FFF = farthest
+    wire        [15:0] mem_c    = clearing ? 16'h0000   : s3_color; // black
+
+    always @(posedge clk_render) begin
+        if (mem_we) begin
+            z_buffer[mem_addr]     <= mem_z;
+            frame_buffer[mem_addr] <= mem_c;
+        end
+    end
+
+    always @(posedge clk_render) begin
+        if (!clearing)
+            s2_old_z <= z_buffer[s1_addr];
     end
 
     // ========================================================================

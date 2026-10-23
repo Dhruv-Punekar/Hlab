@@ -4,7 +4,15 @@
 // Converts one post-clipping, screen-space triangle into a rasterizer payload:
 //   * inclusive integer pixel bounding box (10-bit unsigned indices)
 //   * three signed edge equations  E(x,y) = A*x + B*y + C
-//   * Q24.8 depth plane z(x,y) = zA*x + zB*y + zC
+//   * Q14.18 depth plane z(x,y) = zA*x + zB*y + zC   (z inputs are Q16.16)
+//
+// Depth precision fix (2026-10-22): z inputs were Q24.8 and zA/zB/zC were
+// Q24.8, which rounded every depth slope to a whole 1/256 per pixel (up to
+// ~0.2 NDC depth error inside a face). Now z inputs are Q16.16 and the plane
+// is Q14.18 (range +/-8192, 1/262144 resolution). Only shift amounts, the zC
+// alignment shift and the zC sum width changed: no new multipliers, same
+// DSP48/BRAM count, same latency. Triangles whose slope or zC exceed +/-8192
+// set overflow_zA/zB/zC (as before, just a smaller range).
 //   * shared RGB565 color and status flags
 //
 // With RECIP_NR=0 the outputs are BIT-IDENTICAL to rev A (same LUT, same
@@ -23,7 +31,7 @@
 //
 //   S0  capture + range clamp            S6  Nx*inv, Ny*inv (sign folded in inv)
 //   S1  differences, bbox min/max        S6M |Nx*inv|, |Ny*inv| registered
-//   S2  all products (DSP48 MREG)        S7  |p| >> (e+9), guard/sticky
+//   S2  all products (DSP48 MREG)        S7  |p| >> (e+7), guard/sticky
 //   S3  D, Nx, Ny, edge C (DSP48 PREG)   S8  overflow test, round, saturate zA/zB
 //   S3M |D| (negate) registered          S9  zA*x0, zB*y0
 //   S4  leading-one detect + normalize   S9M zC numerator sum registered
@@ -83,9 +91,9 @@ module triangle_setup_unit_debug #(
     output reg                     overflow,          // OR of range/edge/depth flags
     output reg                     overflow_xy_range, // any x/y input outside contract
     output reg                     overflow_edge_c,   // any edge C not representable in 34 bits
-    output reg                     overflow_zA,       // zA saturated to signed Q24.8
-    output reg                     overflow_zB,       // zB saturated to signed Q24.8
-    output reg                     overflow_zC,       // zC saturated to signed Q24.8
+    output reg                     overflow_zA,       // zA saturated to signed Q14.18
+    output reg                     overflow_zB,       // zB saturated to signed Q14.18
+    output reg                     overflow_zC,       // zC saturated to signed Q14.18
     output reg                     overflow_depth,    // OR of zA/zB/zC flags
     output reg                     bbox_clamped,      // intentional viewport-bound clamp
     output reg                     orient_neg,
@@ -98,6 +106,11 @@ module triangle_setup_unit_debug #(
     localparam signed [31:0] Y_MAX_Q8 = 32'sd102400;  // 400.0 in Q24.8
     localparam integer X_PIX_MAX = 299;
     localparam integer Y_PIX_MAX = 399;
+    // depth formats: input z Q(32-ZIN_F).ZIN_F, output plane Q(32-ZP_F).ZP_F
+    localparam integer ZIN_F     = 16;            // projection_engine z: Q16.16
+    localparam integer ZP_F      = 18;            // zA/zB/zC: Q14.18
+    localparam [6:0]   ZSHIFT0   = 9 + ZIN_F - ZP_F;   // S7 shift = e + ZSHIFT0 (= e+7)
+    localparam integer ZC_ALIGN  = ZP_F + 8 - ZIN_F;   // z0 -> Q(ZP_F+8) for zC (= 10)
 
     // -------------------------------------------------------------------------
     // Global advance / backpressure
@@ -392,7 +405,7 @@ module triangle_setup_unit_debug #(
 
     reg [9:0]         s4_addr;
     reg [24:0]        s4_mant;             // |D| mantissa, Q1.24
-    reg [6:0]         s4_shift;            // e + 9
+    reg [6:0]         s4_shift;            // e + ZSHIFT0 (= e + 7)
     reg               s4_dneg, s4_degen;
     reg signed [52:0] s4_nx, s4_ny;
     reg signed [33:0] s4_e0c, s4_e1c, s4_e2c;
@@ -409,7 +422,7 @@ module triangle_setup_unit_debug #(
         if (pipe_advance) begin
             s4_addr  <= m_dnorm[37:28];
             s4_mant  <= m_dnorm[38:14];
-            s4_shift <= {1'b0, m_dexp} + 7'd9;
+            s4_shift <= {1'b0, m_dexp} + ZSHIFT0;
             s4_dneg  <= m_dneg;
             s4_degen <= m_degen;
             s4_nx <= m_nx;  s4_ny <= m_ny;
@@ -651,7 +664,7 @@ module triangle_setup_unit_debug #(
     //   rounding: half-to-even on q using guard = rem[s-1], sticky = |rem[s-2:0]
     function [35:0] shr_split;          // {q_hi_nz, guard, sticky, q[31:0], 1'b0}
         input [71:0] mag;
-        input [6:0]  sh;                // 9..47
+        input [6:0]  sh;                // 7..45
         reg [71:0] q, mask;
         begin
             q    = mag >> sh;
@@ -700,7 +713,7 @@ module triangle_setup_unit_debug #(
     end
 
     // =========================================================================
-    // S8: overflow test, round-half-even, saturate -> zA, zB (Q24.8)
+    // S8: overflow test, round-half-even, saturate -> zA, zB (Q14.18)
     // =========================================================================
     function [32:0] round_sat;          // {overflow, value[31:0]}
         input [35:0] sp;                // from shr_split
@@ -758,7 +771,7 @@ module triangle_setup_unit_debug #(
     end
 
     // =========================================================================
-    // S9: zA*x0, zB*y0 (Q16), from the exact zA/zB that will be output
+    // S9: zA*x0, zB*y0 (Q26 = Q18 * Q8), from the exact zA/zB that will be output
     // =========================================================================
     reg signed [49:0] s9_pax, s9_pby;
     reg signed [31:0] s9_za, s9_zb;
@@ -795,10 +808,11 @@ module triangle_setup_unit_debug #(
     end
 
     // =========================================================================
-    // S9M: zC numerator z0<<8 - zA*x0 - zB*y0 registered before round/sat
-    // (sum + abs + round + negate in one cycle failed 100 MHz).
+    // S9M: zC numerator (z0<<ZC_ALIGN) - zA*x0 - zB*y0 (Q26) registered before
+    // round/sat (sum + abs + round + negate in one cycle failed 100 MHz).
+    // 52 bits: each product is < 2^49 in magnitude, so the 3-term sum fits.
     // =========================================================================
-    reg signed [50:0] s9m_zc_q16;
+    reg signed [51:0] s9m_zc_q16;
     reg signed [31:0]  s9m_za;
     reg signed [31:0]  s9m_zb;
     reg                s9m_ova;
@@ -826,7 +840,7 @@ module triangle_setup_unit_debug #(
 
     always @(posedge clk) begin
         if (pipe_advance) begin
-            s9m_zc_q16 <= ($signed(s9_z0) <<< 8) - s9_pax - s9_pby;
+            s9m_zc_q16 <= ($signed({{20{s9_z0[31]}}, s9_z0}) <<< ZC_ALIGN) - s9_pax - s9_pby;
             s9m_za <= s9_za;
             s9m_zb <= s9_zb;
             s9m_ova <= s9_ova;
@@ -855,13 +869,13 @@ module triangle_setup_unit_debug #(
     end
 
     // =========================================================================
-    // S10: zC = round_sat((z0<<8 - zA*x0 - zB*y0) >> 8), output registers
+    // S10: zC = round_sat(numerator >> 8) (Q26 -> Q14.18), output registers
     // =========================================================================
-    wire        [50:0] s9_zc_mag = s9m_zc_q16[50] ? -s9m_zc_q16 : s9m_zc_q16;
-    wire        [42:0] s9_zc_q   = s9_zc_mag[50:8];
-    wire [35:0] s9_zc_sp = { |s9_zc_q[42:32], s9_zc_mag[7], |s9_zc_mag[6:0],
+    wire        [51:0] s9_zc_mag = s9m_zc_q16[51] ? -s9m_zc_q16 : s9m_zc_q16;
+    wire        [43:0] s9_zc_q   = s9_zc_mag[51:8];
+    wire [35:0] s9_zc_sp = { |s9_zc_q[43:32], s9_zc_mag[7], |s9_zc_mag[6:0],
                              s9_zc_q[31:0], 1'b0 };
-    wire [32:0] s9m_zc = s9m_degen ? 33'd0 : round_sat(s9_zc_sp, s9m_zc_q16[50]);
+    wire [32:0] s9m_zc = s9m_degen ? 33'd0 : round_sat(s9_zc_sp, s9m_zc_q16[51]);
 
     always @(posedge clk) begin
         if (pipe_advance && v[LATENCY-1]) begin

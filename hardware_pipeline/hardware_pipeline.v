@@ -17,11 +17,16 @@
 // memory-init files so $readmemh finds them):
 //   vertices.mem            -> vertex_memory     (144-bit words)
 //   matrix.mem              -> matrix_memory     (16 x 32-bit Q24.8)
+//                              word order: M33 first ... M00 last, because
+//                              transform_engine reads M00 from matrix_regs[15]
 //   recip_lut_q1_17.mem     -> triangle_setup    (1024 x 18-bit Q1.17)
 //
-// Matrix word order and signed depth are handled inside transform_engine
-// and z_f_buffer themselves, so this top level connects them directly.
-// Setup -> rasterizer: triangles with degenerate || overflow are discarded.
+// Signed depth is handled inside z_f_buffer, so this level connects it directly.
+// Setup -> rasterizer: degenerate, depth-overflow and (CULL_MODE) back-facing
+// triangles are discarded.
+//
+// Depth path (2026-10-22 precision fix): projection z Q16.16 -> setup plane
+// Q14.18 (DEPTH_FRAC) -> rasterizer pixel_z Q6.9 (Z_FRAC_OUT) -> z_f_buffer.
 // ============================================================================
 module hardware_pipeline #(
     parameter NUM_VERTICES    = 36,     // vertices in vertices.mem (multiple of 3)
@@ -29,7 +34,15 @@ module hardware_pipeline #(
     parameter RECIP_LUT_FILE  = "recip_lut_q1_17.mem",
     parameter LOOP_RENDER     = 0,      // 1: re-send the model forever
     // ---- depth precision ----
-    parameter Z_FRAC_OUT       = 4      // rasterizer pixel_z fraction bits (Q12.4; module default 4)
+    parameter Z_FRAC_OUT       = 9,     // rasterizer pixel_z fraction bits (Q6.9); must be <= DEPTH_FRAC+1
+    // ---- back-face culling ----
+    // 0: off (draw both sides)
+    // 1: cull clockwise-on-screen triangles = front faces wound COUNTER-CLOCKWISE
+    //    seen from outside in vertices.mem (OpenGL convention)
+    // 2: opposite (front faces wound CLOCKWISE in vertices.mem)
+    // Requires every triangle in vertices.mem to use the same winding, and a
+    // matrix without a mirror (negative determinant flips the winding).
+    parameter CULL_MODE        = 1
 )(
     input  wire       clk,        // 100 MHz
     input  wire       clk_vga,    // 25 MHz
@@ -90,8 +103,8 @@ module hardware_pipeline #(
         .matrix_out (mm_out)
     );
 
-    // matrix_memory: element k (row-major) at [k*32 +: 32]; transform_engine
-    // reads the bus the same way, so it is connected directly.
+    // matrix_memory: word k at [k*32 +: 32]; transform_engine takes M00 from
+    // [511:480] = word 15, so matrix.mem must be written M33 first ... M00 last.
 
     // ------------------------------------------------------------------------
     // Vertex fetch FSM (the "Master FSM" the transform engine expects).
@@ -223,6 +236,7 @@ module hardware_pipeline #(
     // ------------------------------------------------------------------------
     // Setup -> Rasterizer handshake (pipeline-level connection)
     //   pipe.discard          = setup.degenerate || setup.overflow_depth
+    //                           || back-facing (CULL_MODE)
     //   raster.triangle_valid = setup.out_valid && !pipe.discard
     //   setup.out_ready       = raster.idle_raster || pipe.discard
     //   raster.orient_neg     = setup.orient_neg
@@ -231,7 +245,12 @@ module hardware_pipeline #(
     // ------------------------------------------------------------------------
     wire rast_idle, rast_done;
 
-    wire pipe_discard   = ts_degenerate || ts_ov_depth;
+    // setup.orient_neg = 1 when the screen-space determinant is negative.
+    // Screen y points down, so a triangle wound counter-clockwise in object
+    // space (and facing the camera) arrives with orient_neg = 1.
+    wire back_facing    = (CULL_MODE == 1) ? !ts_orient_neg :
+                          (CULL_MODE == 2) ?  ts_orient_neg : 1'b0;
+    wire pipe_discard   = ts_degenerate || ts_ov_depth || back_facing;
     wire rast_tri_valid = ts_out_valid && !pipe_discard;
     assign ts_out_ready = rast_idle || pipe_discard;
 
@@ -252,6 +271,7 @@ module hardware_pipeline #(
         .ACC_W       (48),
         .Z_OUT_W     (16),
         .FRAC_OUT    (Z_FRAC_OUT),
+        .FRAC_Z      (18),            // setup depth plane is Q14.18
         .COLOR_W     (16),
         .Z_SIGNED    (1),
         .EDGE_C_W    (34),

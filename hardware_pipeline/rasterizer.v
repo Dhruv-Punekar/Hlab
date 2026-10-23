@@ -4,12 +4,15 @@
 // Edge-function triangle rasterizer, 1 pixel evaluated per cycle.
 //
 //  * Samples at pixel centers: (x+0.5, y+0.5)
-//  * Coefficients A, B (edges) and z_A, z_B, z_C are Q24.8 (COEF_W = 32, FRAC_IN = 8)
+//  * Edge coefficients A, B are Q24.8 (COEF_W = 32, FRAC_IN = 8)
+//  * Depth plane z_A, z_B, z_C has FRAC_Z fraction bits (default 8 = old Q24.8;
+//    the pipeline uses 18 = Q14.18 since the 2026-10-22 depth precision fix)
 //  * Edge constants edge0..2_C arrive as Q18.16 (EDGE_C_W = 34, EDGE_C_FRAC = 16) and are
 //    converted to Q24.8 at capture: arithmetic >>> 8, rounded half away from zero
 //    (C_ROUND = 1, keeps C(-edge) == -C(edge) so shared edges stay consistent) or
 //    truncated toward -infinity (C_ROUND = 0)
-//  * pixel_z output is signed Q12.4 (Z_OUT_W = 16, FRAC_OUT = 4), saturating
+//  * pixel_z output is signed, FRAC_OUT fraction bits (Q12.4 by default,
+//    Q6.9 in the pipeline), saturating. Requires FRAC_OUT <= FRAC_Z + 1.
 //  * Inside test: E0 >= 0 && E1 >= 0 && E2 >= 0 (ties count as inside)
 //  * rst_n is asynchronous, active-low
 //
@@ -27,6 +30,7 @@ module rasterizer #(
     parameter ACC_W    = 48,   // accumulator width (signed)
     parameter Z_OUT_W  = 16,   // pixel_z width
     parameter FRAC_OUT = 4,    // fractional bits of pixel_z (Q12.4)
+    parameter FRAC_Z   = 8,    // fractional bits of z_A/z_B/z_C (depth plane)
     parameter COLOR_W  = 16,   // RGB565
     parameter Z_SIGNED = 1,    // 1: pixel_z signed [-2^(W-1),2^(W-1)-1], 0: unsigned
     parameter EDGE_C_W    = 34, // edge constant input width (signed)
@@ -76,7 +80,7 @@ module rasterizer #(
     // Derived constants
     // ------------------------------------------------------------------
     localparam PROD_W  = COEF_W + COORD_W + 1;        // exact signed product width
-    localparam Z_SHIFT = FRAC_IN + 1 - FRAC_OUT;      // doubled scale -> Q12.4  (= 5)
+    localparam Z_SHIFT = FRAC_Z + 1 - FRAC_OUT;       // doubled depth plane -> pixel_z (18+1-9 = 10)
     localparam C_SHIFT = (EDGE_C_FRAC > FRAC_IN) ? (EDGE_C_FRAC - FRAC_IN) : 0;  // Q18.16 -> Q24.8 (= 8)
 
     // Edge constant: Q18.16 -> Q24.8.
