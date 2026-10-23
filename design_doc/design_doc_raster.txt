@@ -14,7 +14,7 @@ edge1_A, edge1_B		32 bits each, signed, Q24.8		Edge 1 equation coefficients
 edge1_C				34 bits, signed, Q18.16			Edge 1 equation constant
 edge2_A, edge2_B		32 bits each, signed, Q24.8		Edge 2 equation coefficients
 edge2_C				34 bits, signed, Q18.16			Edge 2 equation constant
-z_A, z_B, z_C			32 bits each, signed, Q24.8		Depth plane coefficients
+z_A, z_B, z_C			32 bits each, signed, Q14.18		Depth plane coefficients (FRAC_Z = 18; module default FRAC_Z = 8 = Q24.8)
 color_in			16 bits					Constant RGB565 color for the triangle
 
 E_i (x, y) = A_i * x + B_i * y + C_i
@@ -36,7 +36,7 @@ A. DATA OUTPUTS
 Signal					Width					Purpose
 pixel_x					10 bits				Pixel X coordinate
 pixel_y					10 bits				Pixel Y coordinate
-pixel_z					16 bits, signed, Q12.4		Pixel depth (saturating)
+pixel_z					16 bits, signed, Q6.9		Pixel depth (saturating; FRAC_OUT = 9; module default Q12.4)
 pixel_color				16 bits				RGB565 pixel color
 	
 B. Control signals
@@ -83,23 +83,31 @@ Confirmed by simulation with random and burst stalls: the pixel is held, none is
 10. bbox is clamped to pixel dimension (300 x 400). Behaviour for bbox_min > bbox_max is undefined (the scan counters wrap around).
 300 x 400 means 300 pixels wide (x = 0..299) by 400 pixels tall (y = 0..399) = 120,000 pixels.
 
-11. 32 bit number is in Q24.8 and 16 bit is in Q12.4
-Precisely: edge A, B and z_A, z_B, z_C are signed Q24.8 (32 bits). The edge constants edge0..2_C are signed Q18.16 (34 bits). pixel_z is signed Q12.4 (16 bits). pixel_color is RGB565.
+11. 32 bit edge numbers are in Q24.8, the depth plane is in Q14.18 and 16 bit pixel_z is in Q6.9 (pipeline values)
+Precisely: edge A, B are signed Q24.8 (32 bits). z_A, z_B, z_C are signed 32 bits with FRAC_Z fraction bits: Q14.18 in the pipeline (FRAC_Z = 18), Q24.8 with the module default (FRAC_Z = 8). The edge constants edge0..2_C are signed Q18.16 (34 bits). pixel_z is signed 16 bits with FRAC_OUT fraction bits: Q6.9 in the pipeline (FRAC_OUT = 9), Q12.4 with the module default (FRAC_OUT = 4). pixel_color is RGB565.
+Constraint: FRAC_OUT <= FRAC_Z + 1 (the depth output shift may not be negative).
 
 12. The rasterizer uses incremental evaluation of edge and depth functions, with values doubled to represent pixel-center sampling (x+0.5, y+0.5) without fractional arithmetic. Moving right updates the accumulator by (2A), while moving down updates it by (2B), avoiding repeated multiplications for every pixel.
-Accumulators are 48 bits signed. Start value at the center of (xmin, ymin) = 2c + a + b + 2*a*xmin + 2*b*ymin, where c is the Q24.8 constant; one accumulator per plane (edge 0, 1, 2 and depth). Moving to the next row adds 2B to the row-start value and reloads x at xmin.
+Accumulators are 48 bits signed. Start value at the center of (xmin, ymin)
+Accumulator scale: the edge accumulators hold 2x the Q24.8 value (1 LSB = 1/512). The depth accumulator holds 2x the depth plane value (1 LSB = 2^-(FRAC_Z+1), i.e. 2^-19 in the pipeline). With Q14.18 depth inputs the largest depth term is about 2^42, well inside 48 bits.
 
 13. Pixel stream: during SCAN, every enabled cycle loads pixel_x, pixel_y, pixel_z and pixel_color for the next bounding-box position, in row-major order (x fastest). pixel_valid = 1 only if the pixel is inside the triangle; the framebuffer ignores pixels with pixel_valid = 0. pixel_x and pixel_y therefore walk the whole bounding box even when pixel_valid = 0.
 
-14. Depth output: the 2x accumulator is shifted right by 5 (arithmetic, floor) to Q12.4, then saturated to the signed 16-bit range (raw -32768..32767, i.e. -2048.0 .. +2047.9375). It never wraps.
+14. Depth output: the 2x depth accumulator is shifted right by Z_SHIFT = FRAC_Z + 1 - FRAC_OUT (arithmetic, floor) to pixel_z, then saturated to the signed 16-bit range (raw -32768..32767). It never wraps.
+Pipeline: Z_SHIFT = 18 + 1 - 9 = 10, pixel_z is Q6.9, range -64.0 .. +63.998 (1 LSB = 1/512).
+Module default: Z_SHIFT = 8 + 1 - 4 = 5, pixel_z is Q12.4, range -2048.0 .. +2047.9375 (1 LSB = 1/16).
 
 15. Edge constant: edge C arrives as Q18.16 and is converted to Q24.8 at the capture edge by an arithmetic shift of 8 with rounding half away from zero (parameter C_ROUND = 1), so C(-edge) == -C(edge) and shared edges stay consistent. Limit: |C| must be below 2^17 = 131072 in real units (34-bit input). For a 300 x 400 screen with vertices at screen coordinates the largest value is about 400 * 300 = 120,000, which fits; larger screens or vertices far from the origin need Triangle Setup to scale or translate the coefficients (only the sign of E matters, so all of A, B, C of an edge may be scaled by the same positive factor).
 
 16. PIPELINE LEVEL CONNECTION
-	pipe.discard = setup.degenerate || setup.overflow
+	pipe.discard = setup.degenerate || setup.overflow_depth || back_facing
 	raster.triangle_valid = setup.out_valid && !pipe.discard
 	setup.out_ready = rasterizer.idle_raster  || pipe.discard
 	raster.orient_neg = setup.orient_neg
+	back_facing = !setup.orient_neg (CULL_MODE = 1, default), setup.orient_neg (CULL_MODE = 2), 0 (CULL_MODE = 0)
+	setup.overflow_xy_range does not discard: Triangle Setup clamps off-screen vertices to the viewport border and the triangle is drawn.
+	setup.overflow_edge_c is not used: it cannot fire for in-range (clamped) coordinates.
+	Rasterizer parameters in the pipeline: FRAC_Z = 18, FRAC_OUT = Z_FRAC_OUT = 9, all others at the module default.
 
 
 -------------------
@@ -121,24 +129,3 @@ State encoding (dbg_state): IDLE = 0, INIT_A = 1, INIT_B = 2, SCAN = 3, DRAIN = 
 =========================================================================
 
 
-TOP-LEVEL (FPGA BRING-UP) — rasterizer_top.v, raster_demo.v, tri_rom.v
-
-rasterizer_top (board level)
-Signal		Direction	Purpose
-clk		Input		100 MHz board clock
-rst_n		Input		Reset button, active high; the only user input.
-led[15:0]	Output		Display, mapping below
-
-LED map (led[0] = rightmost)
-led[9:0]	pixel_x
-led[10]		pixel_valid
-led[11]		idle_raster
-led[15:12]	{1'b0, state[2:0]}  (state codes as in dbg_state; led[15] always 0)
-
-raster_demo (helper, instantiated by rasterizer_top) generates every rasterizer input:
-- tri_rom: four precomputed test triangles (generated by gen_tri_rom.py), standing in for Triangle Setup: flat right triangle with the hypotenuse through pixel centers (tie test), depth-ramp triangle, triangle straddling x = 511/512, thin sliver.
-- Sequencer: waits GAP cycles (default 100,000,000 = 1 s at 100 MHz), presents a triangle with triangle_valid until the handshake (triangle_valid && idle_raster), waits for done_raster, advances to the next scene (wraps after the fourth), repeats.
-- Slow motion: busy_fbuffer is high except for one cycle every SLOW_DIV clocks, so the rasterizer advances one pixel per SLOW_DIV cycles and the LEDs are readable. Default SLOW_DIV = 12,500,000 (125 ms per pixel at 100 MHz); the counter is 32 bits wide, so any value up to about 4.29 billion fits. SLOW_DIV = 1 runs at full speed.
-
-Log bus (77 bits, output of raster_demo, tagged mark_debug in rasterizer_top so it can be probed with an ILA), MSB to LSB:
-[76:67] pixel_x, [66:57] pixel_y, [56:41] pixel_z, [40] pixel_valid, [39:24] pixel_color, [23] idle_raster, [22:20] state, [19:10] x_cur, [9:0] y_cur
