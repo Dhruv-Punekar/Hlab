@@ -3,8 +3,11 @@
 // ============================================================================
 // Module: vga_controller
 // Purpose: 640x480 @ 60 Hz VGA timing generator for the z_f_buffer read port.
-//          Centers a 300x400 framebuffer in the visible area and converts
-//          RGB565 -> RGB444 for the Nexys A7 VGA DAC.
+//          Centers a 300x400 framebuffer in the visible area and drives the
+//          Nexys A7 VGA DAC (RGB444).
+//
+// Colour input: fb_color is RGB444 {R4, G4, B4} (12 bits), this module passes the
+//          4-bit channels straight to the pins. The picture is unchanged.
 //
 // Pixel clock: 25.175 MHz ideal (25.0 - 25.2 MHz works on most monitors /
 //              VGA-to-HDMI converters).
@@ -17,6 +20,8 @@
 //   => the whole image is shifted by a constant 2 clocks, which is harmless;
 //      what matters is that color, hsync, vsync and blanking all share it.
 // ============================================================================
+
+
 module vga_controller #(
     // Framebuffer geometry
     parameter FB_W   = 300,
@@ -38,7 +43,7 @@ module vga_controller #(
     input  wire        rst_n,       // async assert, active low
     input  wire        fb_ready,    // from z_f_buffer.clear_done (render clk domain)
                                     // tie to 1'b1 if not used
-    input  wire [15:0] fb_color,    // RGB565 from z_f_buffer.vga_color (1-cycle latency)
+    input  wire [11:0] fb_color,    // RGB444 from z_f_buffer.vga_color (1-cycle latency)
 
     output wire [9:0]  fb_x,        // -> z_f_buffer.vga_x
     output wire [9:0]  fb_y,        // -> z_f_buffer.vga_y
@@ -123,7 +128,7 @@ module vga_controller #(
     assign video_active = active_d1;
 
     // ------------------------------------------------------------------------
-    // Stage 2: output registers. RGB565 -> RGB444 by top-bit truncation.
+    // Stage 2: output registers. fb_color is already RGB444.
     // Black when outside window, during reset, or before framebuffer clear.
     // ------------------------------------------------------------------------
     wire show = active_d1 & ready_pix;
@@ -139,9 +144,9 @@ module vga_controller #(
             hsync <= hsync_d1;
             vsync <= vsync_d1;
             if (show) begin
-                vga_r <= fb_color[15:12];	// truncation to 4bits
-                vga_g <= fb_color[10:7];	// truncation to 4bits
-                vga_b <= fb_color[4:1];		// truncation to 4bits
+                vga_r <= fb_color[11:8];
+                vga_g <= fb_color[7:4];
+                vga_b <= fb_color[3:0];
             end else begin
                 vga_r <= 4'h0;
                 vga_g <= 4'h0;
