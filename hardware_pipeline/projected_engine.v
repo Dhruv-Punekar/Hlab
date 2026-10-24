@@ -198,4 +198,49 @@ module projection_engine (
             s5b_yb <= (s5a_uY[31:0] << 3);
             s5b_xhi <= s5a_xhi; s5b_xlo <= s5a_xlo;
             s5b_yhi <= s5a_yhi; s5b_ylo <= s5a_ylo;
+            s5b_Z   <= s5a_Z;
+
+            // STAGE 5C: final sum, saturation, W <= 0 override
+            if (bad[NST-1]) begin
+                proj_X <= 32'sh7FFF_FFFF;     // forces setup overflow -> discard
+                proj_Y <= 32'sh7FFF_FFFF;
+            end else begin
+                proj_X <= s5b_xhi ? 32'sh7FFF_FFFF : s5b_xlo ? 32'sh8000_0000 : (s5b_xa + s5b_xb);
+                proj_Y <= s5b_yhi ? 32'sh7FFF_FFFF : s5b_ylo ? 32'sh8000_0000 : (s5b_ya + s5b_yb);
+            end
+            proj_Z <= s5b_Z;
+        end
+    end
+
+    // ========================================================================
+    // STAGE 9: TRIANGLE ACCUMULATION PACKER (Discrete Ports)  - unchanged
+    // ========================================================================
+    reg [1:0] vertex_count;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            vertex_count <= 2'd0;
+            valid_out    <= 1'b0;
+        end else begin
+            if (valid_out && ready_in)
+                valid_out <= 1'b0;
+
+            if (val[NST] && pipe_advance) begin
+                if (vertex_count == 2'd2) begin
+                    out_x2 <= proj_X; out_y2 <= proj_Y; out_z2 <= proj_Z;
+                    out_face_color <= col[NST];
+                    valid_out      <= 1'b1;
+                    vertex_count   <= 2'd0;
+                end else if (vertex_count == 2'd1) begin
+                    out_x1 <= proj_X; out_y1 <= proj_Y; out_z1 <= proj_Z;
+                    vertex_count <= 2'd2;
+                end else begin
+                    out_x0 <= proj_X; out_y0 <= proj_Y; out_z0 <= proj_Z;
+                    vertex_count <= 2'd1;
+                end
+            end
+        end
+    end
+
+endmodule
          
