@@ -25,6 +25,17 @@
 // Setup -> rasterizer: degenerate, depth-overflow and (CULL_MODE) back-facing
 // triangles are discarded.
 //
+// Re-render / animation ports (2026-10-24, used by cube_top):
+//   rst_render_n  extra active-low reset for the RENDER domain only. Pulsing it
+//                 low clears the z/framebuffer and re-draws the model, while the
+//                 VGA timing keeps running (rst_n still resets both domains).
+//                 Tie to 1'b1 if unused.
+//   mat_we/addr/data  write port of matrix_memory (word k = matrix_regs[k],
+//                 same order as matrix.mem: M33 first ... M00 last). Write only
+//                 while rst_render_n = 0, so no vertex is in flight. Tie off if unused.
+//   render_done   1 when the vertex fetch has finished, the z-buffer clear is
+//                 done and every stage has been idle for 64 clocks.
+//
 // Depth path (2026-10-22 precision fix): projection z Q16.16 -> setup plane
 // Q14.18 (DEPTH_FRAC) -> rasterizer pixel_z Q6.9 (Z_FRAC_OUT) -> z_f_buffer.
 // ============================================================================
@@ -46,7 +57,15 @@ module hardware_pipeline #(
 )(
     input  wire       clk,        // 100 MHz
     input  wire       clk_vga,    // 25 MHz
-    input  wire       rst_n,      // active-low
+    input  wire       rst_n,      // active-low, resets render + VGA domains
+    input  wire       rst_render_n, // active-low, resets the render domain only (re-render)
+
+    // matrix write port (load a new matrix while rst_render_n = 0)
+    input  wire        mat_we,
+    input  wire [3:0]  mat_addr,
+    input  wire [31:0] mat_data,
+
+    output wire       render_done,  // model drawn, pipeline idle
 
     output wire [3:0] vga_r,
     output wire [3:0] vga_g,
@@ -61,8 +80,10 @@ module hardware_pipeline #(
     (* ASYNC_REG = "TRUE" *) reg [1:0] rst_sync_r = 2'b00;
     (* ASYNC_REG = "TRUE" *) reg [1:0] rst_sync_v = 2'b00;
 
-    always @(posedge clk or negedge rst_n)
-        if (!rst_n) rst_sync_r <= 2'b00;
+    wire rst_n_render_src = rst_n & rst_render_n;
+
+    always @(posedge clk or negedge rst_n_render_src)
+        if (!rst_n_render_src) rst_sync_r <= 2'b00;
         else        rst_sync_r <= {rst_sync_r[0], 1'b1};
 
     always @(posedge clk_vga or negedge rst_n)
@@ -97,9 +118,9 @@ module hardware_pipeline #(
 
     matrix_memory u_matrix_memory (
         .clk        (clk),
-        .we         (1'b0),
-        .write_addr (4'd0),
-        .write_data (32'd0),
+        .we         (mat_we),
+        .write_addr (mat_addr),
+        .write_data (mat_data),
         .matrix_out (mm_out)
     );
 
@@ -366,5 +387,20 @@ module hardware_pipeline #(
         .vsync        (vga_vs),
         .video_active (vga_active)
     );
+
+    // ========================================================================
+    // 8) RENDER DONE: fetch finished, clear finished, all links quiet 64 clocks
+    //    (64 > the longest internal latency, so nothing is still in flight)
+    // ========================================================================
+    reg [6:0] quiet_cnt;
+    wire links_quiet = (f_state == F_DONE) && zf_clear_done && rast_idle &&
+                       !te_valid_out && !pe_valid_out && !ts_out_valid && !rs_pvalid;
+
+    always @(posedge clk or negedge rst_n_r) begin
+        if (!rst_n_r)          quiet_cnt <= 7'd0;
+        else if (!links_quiet) quiet_cnt <= 7'd0;
+        else if (!quiet_cnt[6]) quiet_cnt <= quiet_cnt + 7'd1;
+    end
+    assign render_done = quiet_cnt[6];
 
 endmodule

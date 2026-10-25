@@ -111,10 +111,7 @@ module z_f_buffer #(
             // FAST CLEAR FSM
             // ----------------------------------------------------------------
             if (state == STATE_CLEAR) begin
-                // Wipe both Z and Color memories
-                z_buffer[clear_addr] <= 16'sh7FFF; // Farthest signed depth (0x7FFF)
-                frame_buffer[clear_addr] <= 12'h000; // Black
-
+                // Wipe both Z and Color memories (write port below, mem_* = clear)
                 clear_addr <= clear_addr + 1;
 
                 // Stop when we reach the end of the memory
@@ -146,8 +143,7 @@ module z_f_buffer #(
                 s2_color <= s1_color;
                 s2_valid <= s1_valid;
 
-                // Synchronous BRAM Read (Fetching the old Z value)
-                s2_old_z <= z_buffer[s1_addr];
+                // (synchronous BRAM read of the old Z value: s2_old_z, below)
 
                 // ------------------------------------------------------------
                 // STAGE 3: WRITE (With Distance-1 & Distance-2 Forwarding)
@@ -172,13 +168,32 @@ module z_f_buffer #(
                 end else begin
                     s3_we <= s2_valid && (s2_z < s2_old_z); // Normal BRAM Read (signed)
                 end
-
-                // Execute the actual memory write
-                if (s3_we) begin
-                    z_buffer[s3_addr] <= s3_z;
-                    frame_buffer[s3_addr] <= s3_color;
-                end
             end
+        end
+    end
+
+    // ========================================================================
+    // MEMORY PORTS (BRAM inference, 2026-10-24)
+    //   Vivado can only map an array to block RAM when it is accessed in a
+    //   clocked block WITHOUT an asynchronous reset, through one write port.
+    //   The clear and the pixel write are therefore merged into a single
+    //   write port here (same behaviour as before: during CLEAR s3_we is 0).
+    //   z_buffer:     1 write port + 1 read port, render clock  (simple dual port)
+    //   frame_buffer: 1 write port (render clock) + VGA read port (vga clock)
+    //   Read and write in the same block -> read-first, as the original code
+    //   (the distance-2 forwarding relies on that "stale read").
+    // ========================================================================
+    wire        clearing  = (state == STATE_CLEAR);
+    wire        mem_we    = clearing | s3_we;
+    wire [18:0] mem_addr  = clearing ? clear_addr  : s3_addr;
+    wire [15:0] mem_z     = clearing ? 16'sh7FFF   : s3_z;      // far on clear
+    wire [11:0] mem_color = clearing ? 12'h000     : s3_color;  // black on clear
+
+    always @(posedge clk_render) begin
+        s2_old_z <= z_buffer[s1_addr];                 // stage-2 read
+        if (mem_we) begin
+            z_buffer[mem_addr]     <= mem_z;
+            frame_buffer[mem_addr] <= mem_color;
         end
     end
 
