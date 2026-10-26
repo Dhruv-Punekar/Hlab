@@ -3,6 +3,7 @@ DETAILED TECHNICAL DESCRIPTION: INITIAL MODULES
 ========================================================================
 
 
+
 1. SYSTEM OVERVIEW
 This document describes the entry point of the hardware graphics pipeline, 
 specifically the memory modules that hold the initial data provided by the 
