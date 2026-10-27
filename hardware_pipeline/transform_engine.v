@@ -22,6 +22,8 @@ module transform_engine (
     output wire [143:0] vertex_out  // Transformed Vertex {X', Y', Z', W', RGB565}
 );
 
+    localparam NST = 3;             // pipeline stages
+
     // ========================================================================
     // COMBINATIONAL FUNCTIONS (Saturation Safety Nets)
     // ========================================================================
@@ -90,7 +92,7 @@ module transform_engine (
     // ========================================================================
     // PIPELINE REGISTERS
     // ========================================================================
-    reg val_stg1, val_stg2, val_stg3;
+    reg [NST-1:0] val;
     reg [15:0] color_stg1, color_stg2, color_stg3;
 
     // Stage 1: 64-bit Multiplication Results
@@ -115,13 +117,11 @@ module transform_engine (
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            val_stg1 <= 0; val_stg2 <= 0; val_stg3 <= 0;
+            val <= {NST{1'b0}};
         end else if (ready_in) begin
             
             // Push Valid Flags & Color through pipeline
-            val_stg1 <= valid_in;
-            val_stg2 <= val_stg1;
-            val_stg3 <= val_stg2;
+            val <= {val[NST-2:0], valid_in};
 
             color_stg1 <= in_C;
             color_stg2 <= color_stg1;
@@ -165,6 +165,6 @@ module transform_engine (
     // OUTPUT ASSIGNMENT
     // ========================================================================
     assign vertex_out = {out_X, out_Y, out_Z, out_W, color_stg3};
-    assign valid_out  = val_stg3;
+    assign valid_out  = val[NST-1];
 
 endmodule
