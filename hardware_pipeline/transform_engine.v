@@ -59,37 +59,6 @@ module transform_engine (
     endfunction
 
     // ========================================================================
-    // 1. DATA UNPACKING (Combinational)
-    // ========================================================================
-    // Extract Vertex Coordinates
-    wire signed [31:0] in_X = $signed(vertex_in[143:112]);
-    wire signed [31:0] in_Y = $signed(vertex_in[111:80]);
-    wire signed [31:0] in_Z = $signed(vertex_in[79:48]);
-    wire signed [31:0] in_W = $signed(vertex_in[47:16]);
-    wire        [15:0] in_C = vertex_in[15:0];
-
-    // Extract Matrix Elements (Rows 0 to 3)
-    wire signed [31:0] M00 = $signed(matrix_in[511:480]);
-    wire signed [31:0] M01 = $signed(matrix_in[479:448]);
-    wire signed [31:0] M02 = $signed(matrix_in[447:416]);
-    wire signed [31:0] M03 = $signed(matrix_in[415:384]);
-    
-    wire signed [31:0] M10 = $signed(matrix_in[383:352]);
-    wire signed [31:0] M11 = $signed(matrix_in[351:320]);
-    wire signed [31:0] M12 = $signed(matrix_in[319:288]);
-    wire signed [31:0] M13 = $signed(matrix_in[287:256]);
-    
-    wire signed [31:0] M20 = $signed(matrix_in[255:224]);
-    wire signed [31:0] M21 = $signed(matrix_in[223:192]);
-    wire signed [31:0] M22 = $signed(matrix_in[191:160]);
-    wire signed [31:0] M23 = $signed(matrix_in[159:128]);
-    
-    wire signed [31:0] M30 = $signed(matrix_in[127:96]);
-    wire signed [31:0] M31 = $signed(matrix_in[95:64]);
-    wire signed [31:0] M32 = $signed(matrix_in[63:32]);
-    wire signed [31:0] M33 = $signed(matrix_in[31:0]);
-
-    // ========================================================================
     // HANDSHAKE: global stall, same as before
     // ========================================================================
     assign ready_out = ready_in; // Back-pressure propagation
@@ -103,39 +72,44 @@ module transform_engine (
 
     // ========================================================================
     // DATAPATH (no reset -> DSP48E1 register packing)
+    //   v_r[c]          vertex component c (0=X 1=Y 2=Z 3=W)
+    //   m_r[r*4+c]      matrix element M[r][c]
+    //   p[r*4+c]        product v[c] * M[r][c]
     // ========================================================================
-    reg [15:0]        col  [0:NST-1];
+    reg signed [31:0] v_r  [0:3];
+    reg signed [31:0] m_r  [0:15];
     reg signed [63:0] p    [0:15];
     reg signed [31:0] s_ab [0:3];   // row r: sat_trunc(p[r,0]) + sat_trunc(p[r,1])
     reg signed [31:0] s_cd [0:3];   // row r: sat_trunc(p[r,2]) + sat_trunc(p[r,3])
     reg signed [31:0] o    [0:3];   // X', Y', Z', W'
+    reg        [15:0] col  [0:NST-1];
 
     integer i, r;
     always @(posedge clk) begin
         if (ready_in) begin
             // colour travels with the vertex, one register per stage
-            col[0] <= in_C;
+            col[0] <= vertex_in[15:0];
             for (i = 1; i < NST; i = i + 1) col[i] <= col[i-1];
 
-            // ----------------------------------------------------------------
-            // STAGE 1: 16 PARALLEL MULTIPLICATIONS (Infers DSP48E1 slices)
-            // ----------------------------------------------------------------
-            p[0]  <= in_X * M00; p[1]  <= in_Y * M01; p[2]  <= in_Z * M02; p[3]  <= in_W * M03;
-            p[4]  <= in_X * M10; p[5]  <= in_Y * M11; p[6]  <= in_Z * M12; p[7]  <= in_W * M13;
-            p[8]  <= in_X * M20; p[9]  <= in_Y * M21; p[10] <= in_Z * M22; p[11] <= in_W * M23;
-            p[12] <= in_X * M30; p[13] <= in_Y * M31; p[14] <= in_Z * M32; p[15] <= in_W * M33;
+            // S0: register inputs
+            v_r[0] <= $signed(vertex_in[143:112]);   // X
+            v_r[1] <= $signed(vertex_in[111:80]);    // Y
+            v_r[2] <= $signed(vertex_in[79:48]);     // Z
+            v_r[3] <= $signed(vertex_in[47:16]);     // W
+            for (i = 0; i < 16; i = i + 1)
+                m_r[i] <= $signed(matrix_in[(15 - i)*32 +: 32]);   // element 0 = M00 = [511:480]
 
-            // ----------------------------------------------------------------
-            // STAGE 2: SATURATION TRUNCATION & ADDER TREE STAGE 1
-            // ----------------------------------------------------------------
+            // S1: 16 multiplies (row r = i/4, column c = i%4)
+            for (i = 0; i < 16; i = i + 1)
+                p[i] <= v_r[i % 4] * m_r[i];
+
+            // S2: saturating truncation + first adder level
             for (r = 0; r < 4; r = r + 1) begin
                 s_ab[r] <= sat_add(sat_trunc(p[r*4 + 0]), sat_trunc(p[r*4 + 1]));
                 s_cd[r] <= sat_add(sat_trunc(p[r*4 + 2]), sat_trunc(p[r*4 + 3]));
             end
 
-            // ----------------------------------------------------------------
-            // STAGE 3: SATURATION ADDER TREE STAGE 2 (Final Transform)
-            // ----------------------------------------------------------------
+            // S3: final sum
             for (r = 0; r < 4; r = r + 1)
                 o[r] <= sat_add(s_ab[r], s_cd[r]);
         end
