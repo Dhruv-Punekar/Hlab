@@ -74,10 +74,11 @@ module transform_engine (
     // DATAPATH (no reset -> DSP48E1 register packing)
     //   v_r[c]          vertex component c (0=X 1=Y 2=Z 3=W)
     //   m_r[r*4+c]      matrix element M[r][c]
-    //   p[r*4+c]        product v[c] * M[r][c]
+    //   pm/p[r*4+c]     product v[c] * M[r][c]
     // ========================================================================
     reg signed [31:0] v_r  [0:3];
     reg signed [31:0] m_r  [0:15];
+    reg signed [63:0] pm   [0:15];
     reg signed [63:0] p    [0:15];
     reg signed [31:0] s_ab [0:3];   // row r: sat_trunc(p[r,0]) + sat_trunc(p[r,1])
     reg signed [31:0] s_cd [0:3];   // row r: sat_trunc(p[r,2]) + sat_trunc(p[r,3])
@@ -101,15 +102,19 @@ module transform_engine (
 
             // S1: 16 multiplies (row r = i/4, column c = i%4)
             for (i = 0; i < 16; i = i + 1)
-                p[i] <= v_r[i % 4] * m_r[i];
+                pm[i] <= v_r[i % 4] * m_r[i];
 
-            // S2: saturating truncation + first adder level
+            // S2: second product register (DSP pipeline)
+            for (i = 0; i < 16; i = i + 1)
+                p[i] <= pm[i];
+
+            // S3: saturating truncation + first adder level
             for (r = 0; r < 4; r = r + 1) begin
                 s_ab[r] <= sat_add(sat_trunc(p[r*4 + 0]), sat_trunc(p[r*4 + 1]));
                 s_cd[r] <= sat_add(sat_trunc(p[r*4 + 2]), sat_trunc(p[r*4 + 3]));
             end
 
-            // S3: final sum
+            // S4: final sum
             for (r = 0; r < 4; r = r + 1)
                 o[r] <= sat_add(s_ab[r], s_cd[r]);
         end
