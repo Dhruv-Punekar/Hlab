@@ -93,7 +93,7 @@ module transform_engine (
     // PIPELINE REGISTERS
     // ========================================================================
     reg [NST-1:0] val;
-    reg [15:0] color_stg1, color_stg2, color_stg3;
+    reg [15:0]    col [0:NST-1];
 
     // Stage 1: 64-bit Multiplication Results
     reg signed [63:0] pX0, pX1, pX2, pX3;
@@ -115,6 +115,7 @@ module transform_engine (
     // ========================================================================
     assign ready_out = ready_in; // Back-pressure propagation
 
+    integer i;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             val <= {NST{1'b0}};
@@ -123,9 +124,8 @@ module transform_engine (
             // Push Valid Flags & Color through pipeline
             val <= {val[NST-2:0], valid_in};
 
-            color_stg1 <= in_C;
-            color_stg2 <= color_stg1;
-            color_stg3 <= color_stg2;
+            col[0] <= in_C;
+            for (i = 1; i < NST; i = i + 1) col[i] <= col[i-1];
 
             // ----------------------------------------------------------------
             // STAGE 1: 16 PARALLEL MULTIPLICATIONS (Infers DSP48E1 slices)
@@ -164,7 +164,7 @@ module transform_engine (
     // ========================================================================
     // OUTPUT ASSIGNMENT
     // ========================================================================
-    assign vertex_out = {out_X, out_Y, out_Z, out_W, color_stg3};
+    assign vertex_out = {out_X, out_Y, out_Z, out_W, col[NST-1]};
     assign valid_out  = val[NST-1];
 
 endmodule
