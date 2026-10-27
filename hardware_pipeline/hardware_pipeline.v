@@ -145,7 +145,8 @@ module hardware_pipeline #(
             vm_addr <= {VADDR_W{1'b0}};
         end else begin
             case (f_state)
-                F_ISSUE: f_state <= F_SEND;
+                F_ISSUE: f_state <= F_WAIT;
+                F_WAIT:  f_state <= F_SEND;
                 F_SEND: if (te_ready_out) begin
                     if (vm_addr == NUM_VERTICES - 1) begin
                         vm_addr <= {VADDR_W{1'b0}};
