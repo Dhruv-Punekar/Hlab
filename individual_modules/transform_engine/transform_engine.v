@@ -2,37 +2,62 @@
 
 // ============================================================================
 // Module: transform_engine
-// Purpose: Applies a 4x4 Transformation Matrix to a 3D vertex using a 
-//          fully pipelined 3-stage DSP datapath. Uses Q24.8 Fixed-Point math.
+// Purpose: Applies a 4x4 Transformation Matrix to a 3D vertex using a
+//          fully pipelined DSP datapath. Uses Q24.8 Fixed-Point math.
 // Features: Handshaking (CE Stalls), Color Passthrough, Saturation logic.
+//
+// Timing fix (2026-10-27): 5 pipeline stages (was 3).
+//   The old stage 1 did "input pins -> 32x32 multiply -> register" in one
+//   cycle (~8.9 ns of DSP + carry logic). Anything in front of it (matrix
+//   register fan-out, vertex BRAM clock-to-out + route) broke 100 MHz:
+//   +0.185 ns for the cube, -3.1 ns for the 4096-vertex picture.
+//     S0  register the vertex and the matrix      (-> DSP48 A/B input regs)
+//     S1  32x32 multiply, first register          (-> DSP48 M/P regs, cascade)
+//     S2  multiply, second register               (lets Vivado finish the
+//                                                   multi-DSP product inside
+//                                                   the DSP pipeline)
+//     S3  saturating truncation + first add level  (unchanged maths)
+//     S4  second add level -> output               (unchanged maths)
+//   Results are bit-identical to the 3-stage version; only latency grows
+//   from 3 to 5 cycles. Throughput stays 1 vertex per clock.
+//
+//   Data registers sit in a block WITHOUT reset, so Vivado can pack them into
+//   the DSP48E1 registers (those only have a synchronous reset). Only the
+//   valid bits use the asynchronous reset.
+//   Every register advances only when ready_in = 1 (global stall), so data,
+//   colour and valid always stay aligned.
+//
+// Matrix word order: M00 = matrix_in[511:480] ... M33 = matrix_in[31:0]
+// (matrix_memory word 15 = M00, i.e. matrix.mem written M33 first).
 // ============================================================================
 module transform_engine (
     input  wire         clk,
     input  wire         rst_n,      // Active-low reset
-    
+
     // Handshake Signals
     input  wire         valid_in,   // High when Master FSM provides valid data
     output wire         ready_out,  // High when this module can accept new data
     input  wire         ready_in,   // High when Projection Engine can accept data
     output wire         valid_out,  // High when output math is finished
-    
+
     // Data Interfaces
     input  wire [143:0] vertex_in,  // Incoming Vertex {X, Y, Z, W, RGB565}
     input  wire [511:0] matrix_in,  // 4x4 Transformation Matrix (16x 32-bit)
     output wire [143:0] vertex_out  // Transformed Vertex {X', Y', Z', W', RGB565}
 );
 
+    localparam NST = 5;             // pipeline stages S0..S4
+
     // ========================================================================
-    // COMBINATIONAL FUNCTIONS (Saturation Safety Nets)
+    // COMBINATIONAL FUNCTIONS (Saturation Safety Nets) - unchanged
     // ========================================================================
     // 1. Saturation Truncation (64-bit to 32-bit Q24.8)
-    // Prevents extreme scaling overflow from wrapping around the screen.
     function signed [31:0] sat_trunc;
         input signed [63:0] prod;
         begin
-            if (prod[63] == 1'b0 && (|prod[62:39] == 1'b1)) 
+            if (prod[63] == 1'b0 && (|prod[62:39] == 1'b1))
                 sat_trunc = 32'h7FFF_FFFF; // Clamp to Max Positive
-            else if (prod[63] == 1'b1 && (~&prod[62:39] == 1'b1)) 
+            else if (prod[63] == 1'b1 && (~&prod[62:39] == 1'b1))
                 sat_trunc = 32'h8000_0000; // Clamp to Max Negative
             else
                 sat_trunc = prod[39:8];    // Normal Truncation
@@ -40,7 +65,6 @@ module transform_engine (
     endfunction
 
     // 2. Saturation Addition (32-bit + 32-bit)
-    // Prevents adding two massive numbers from flipping the sign bit.
     function signed [31:0] sat_add;
         input signed [31:0] a;
         input signed [31:0] b;
@@ -57,114 +81,71 @@ module transform_engine (
     endfunction
 
     // ========================================================================
-    // 1. DATA UNPACKING (Combinational)
+    // HANDSHAKE: global stall, same as before
     // ========================================================================
-    // Extract Vertex Coordinates
-    wire signed [31:0] in_X = $signed(vertex_in[143:112]);
-    wire signed [31:0] in_Y = $signed(vertex_in[111:80]);
-    wire signed [31:0] in_Z = $signed(vertex_in[79:48]);
-    wire signed [31:0] in_W = $signed(vertex_in[47:16]);
-    wire        [15:0] in_C = vertex_in[15:0];
+    assign ready_out = ready_in;
 
-    // Extract Matrix Elements (Rows 0 to 3)
-    wire signed [31:0] M00 = $signed(matrix_in[511:480]);
-    wire signed [31:0] M01 = $signed(matrix_in[479:448]);
-    wire signed [31:0] M02 = $signed(matrix_in[447:416]);
-    wire signed [31:0] M03 = $signed(matrix_in[415:384]);
-    
-    wire signed [31:0] M10 = $signed(matrix_in[383:352]);
-    wire signed [31:0] M11 = $signed(matrix_in[351:320]);
-    wire signed [31:0] M12 = $signed(matrix_in[319:288]);
-    wire signed [31:0] M13 = $signed(matrix_in[287:256]);
-    
-    wire signed [31:0] M20 = $signed(matrix_in[255:224]);
-    wire signed [31:0] M21 = $signed(matrix_in[223:192]);
-    wire signed [31:0] M22 = $signed(matrix_in[191:160]);
-    wire signed [31:0] M23 = $signed(matrix_in[159:128]);
-    
-    wire signed [31:0] M30 = $signed(matrix_in[127:96]);
-    wire signed [31:0] M31 = $signed(matrix_in[95:64]);
-    wire signed [31:0] M32 = $signed(matrix_in[63:32]);
-    wire signed [31:0] M33 = $signed(matrix_in[31:0]);
-
-    // ========================================================================
-    // PIPELINE REGISTERS
-    // ========================================================================
-    reg val_stg1, val_stg2, val_stg3;
-    reg [15:0] color_stg1, color_stg2, color_stg3;
-
-    // Stage 1: 64-bit Multiplication Results
-    reg signed [63:0] pX0, pX1, pX2, pX3;
-    reg signed [63:0] pY0, pY1, pY2, pY3;
-    reg signed [63:0] pZ0, pZ1, pZ2, pZ3;
-    reg signed [63:0] pW0, pW1, pW2, pW3;
-
-    // Stage 2: 32-bit Partial Sums
-    reg signed [31:0] sX_AB, sX_CD;
-    reg signed [31:0] sY_AB, sY_CD;
-    reg signed [31:0] sZ_AB, sZ_CD;
-    reg signed [31:0] sW_AB, sW_CD;
-
-    // Stage 3: Final 32-bit Output
-    reg signed [31:0] out_X, out_Y, out_Z, out_W;
-
-    // ========================================================================
-    // CLOCKED PIPELINE LOGIC
-    // ========================================================================
-    assign ready_out = ready_in; // Back-pressure propagation
-
+    // valid bits: the only registers with a reset
+    reg [NST-1:0] val;
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            val_stg1 <= 0; val_stg2 <= 0; val_stg3 <= 0;
-        end else if (ready_in) begin
-            
-            // Push Valid Flags & Color through pipeline
-            val_stg1 <= valid_in;
-            val_stg2 <= val_stg1;
-            val_stg3 <= val_stg2;
+        if (!rst_n)        val <= {NST{1'b0}};
+        else if (ready_in) val <= {val[NST-2:0], valid_in};
+    end
 
-            color_stg1 <= in_C;
-            color_stg2 <= color_stg1;
-            color_stg3 <= color_stg2;
+    // ========================================================================
+    // DATAPATH (no reset -> DSP48E1 register packing)
+    //   v_r[c]          vertex component c (0=X 1=Y 2=Z 3=W)
+    //   m_r[r*4+c]      matrix element M[r][c]
+    //   pm/p[r*4+c]     product v[c] * M[r][c]
+    // ========================================================================
+    reg signed [31:0] v_r  [0:3];
+    reg signed [31:0] m_r  [0:15];
+    reg signed [63:0] pm   [0:15];
+    reg signed [63:0] p    [0:15];
+    reg signed [31:0] s_ab [0:3];   // row r: sat_trunc(p[r,0]) + sat_trunc(p[r,1])
+    reg signed [31:0] s_cd [0:3];   // row r: sat_trunc(p[r,2]) + sat_trunc(p[r,3])
+    reg signed [31:0] o    [0:3];   // X', Y', Z', W'
+    reg        [15:0] col  [0:NST-1];
 
-            // ----------------------------------------------------------------
-            // STAGE 1: 16 PARALLEL MULTIPLICATIONS (Infers DSP48E1 slices)
-            // ----------------------------------------------------------------
-            pX0 <= in_X * M00;  pX1 <= in_Y * M01;  pX2 <= in_Z * M02;  pX3 <= in_W * M03;
-            pY0 <= in_X * M10;  pY1 <= in_Y * M11;  pY2 <= in_Z * M12;  pY3 <= in_W * M13;
-            pZ0 <= in_X * M20;  pZ1 <= in_Y * M21;  pZ2 <= in_Z * M22;  pZ3 <= in_W * M23;
-            pW0 <= in_X * M30;  pW1 <= in_Y * M31;  pW2 <= in_Z * M32;  pW3 <= in_W * M33;
+    integer i, r;
+    always @(posedge clk) begin
+        if (ready_in) begin
+            // colour travels with the vertex, one register per stage
+            col[0] <= vertex_in[15:0];
+            for (i = 1; i < NST; i = i + 1) col[i] <= col[i-1];
 
-            // ----------------------------------------------------------------
-            // STAGE 2: SATURATION TRUNCATION & ADDER TREE STAGE 1
-            // ----------------------------------------------------------------
-            sX_AB <= sat_add(sat_trunc(pX0), sat_trunc(pX1));
-            sX_CD <= sat_add(sat_trunc(pX2), sat_trunc(pX3));
-            
-            sY_AB <= sat_add(sat_trunc(pY0), sat_trunc(pY1));
-            sY_CD <= sat_add(sat_trunc(pY2), sat_trunc(pY3));
-            
-            sZ_AB <= sat_add(sat_trunc(pZ0), sat_trunc(pZ1));
-            sZ_CD <= sat_add(sat_trunc(pZ2), sat_trunc(pZ3));
-            
-            sW_AB <= sat_add(sat_trunc(pW0), sat_trunc(pW1));
-            sW_CD <= sat_add(sat_trunc(pW2), sat_trunc(pW3));
+            // S0: register inputs
+            v_r[0] <= $signed(vertex_in[143:112]);   // X
+            v_r[1] <= $signed(vertex_in[111:80]);    // Y
+            v_r[2] <= $signed(vertex_in[79:48]);     // Z
+            v_r[3] <= $signed(vertex_in[47:16]);     // W
+            for (i = 0; i < 16; i = i + 1)
+                m_r[i] <= $signed(matrix_in[(15 - i)*32 +: 32]);   // element 0 = M00 = [511:480]
 
-            // ----------------------------------------------------------------
-            // STAGE 3: SATURATION ADDER TREE STAGE 2 (Final Transform)
-            // ----------------------------------------------------------------
-            out_X <= sat_add(sX_AB, sX_CD);
-            out_Y <= sat_add(sY_AB, sY_CD);
-            out_Z <= sat_add(sZ_AB, sZ_CD);
-            out_W <= sat_add(sW_AB, sW_CD);
+            // S1: 16 multiplies (row r = i/4, column c = i%4)
+            for (i = 0; i < 16; i = i + 1)
+                pm[i] <= v_r[i % 4] * m_r[i];
 
+            // S2: second product register (DSP pipeline)
+            for (i = 0; i < 16; i = i + 1)
+                p[i] <= pm[i];
+
+            // S3: saturating truncation + first adder level
+            for (r = 0; r < 4; r = r + 1) begin
+                s_ab[r] <= sat_add(sat_trunc(p[r*4 + 0]), sat_trunc(p[r*4 + 1]));
+                s_cd[r] <= sat_add(sat_trunc(p[r*4 + 2]), sat_trunc(p[r*4 + 3]));
+            end
+
+            // S4: final sum
+            for (r = 0; r < 4; r = r + 1)
+                o[r] <= sat_add(s_ab[r], s_cd[r]);
         end
     end
 
     // ========================================================================
     // OUTPUT ASSIGNMENT
     // ========================================================================
-    assign vertex_out = {out_X, out_Y, out_Z, out_W, color_stg3};
-    assign valid_out  = val_stg3;
+    assign vertex_out = {o[0], o[1], o[2], o[3], col[NST-1]};
+    assign valid_out  = val[NST-1];
 
 endmodule
