@@ -132,7 +132,7 @@ module hardware_pipeline #(
     // BRAM has 1-cycle read latency, so: ISSUE (en=1) -> SEND (data valid,
     // held stable because en=0) until transform_engine accepts it.
     // ------------------------------------------------------------------------
-    localparam F_ISSUE = 2'd0, F_SEND = 2'd1, F_DONE = 2'd2;
+    localparam F_ISSUE = 2'd0, F_SEND = 2'd1, F_DONE = 2'd2, F_WAIT = 2'd3;
     reg  [1:0] f_state;
 
     wire te_ready_out;
