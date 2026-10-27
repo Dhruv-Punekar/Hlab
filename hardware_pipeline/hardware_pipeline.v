@@ -129,7 +129,8 @@ module hardware_pipeline #(
 
     // ------------------------------------------------------------------------
     // Vertex fetch FSM (the "Master FSM" the transform engine expects).
-    // BRAM has 1-cycle read latency, so: ISSUE (en=1) -> SEND (data valid,
+    // vertex_memory has a 2-cycle registered read (BRAM output register used,
+    // timing fix 2026-10-27), so: ISSUE (en=1) -> WAIT -> SEND (data valid,
     // held stable because en=0) until transform_engine accepts it.
     // ------------------------------------------------------------------------
     localparam F_ISSUE = 2'd0, F_SEND = 2'd1, F_DONE = 2'd2, F_WAIT = 2'd3;
