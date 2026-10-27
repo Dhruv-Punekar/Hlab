@@ -90,35 +90,30 @@ module transform_engine (
     wire signed [31:0] M33 = $signed(matrix_in[31:0]);
 
     // ========================================================================
-    // PIPELINE REGISTERS
-    // ========================================================================
-    reg [NST-1:0] val;
-    reg [15:0]    col [0:NST-1];
-
-    // Stage 1: 64-bit Multiplication Results
-    reg signed [63:0] p [0:15];
-
-    // Stage 2: 32-bit Partial Sums
-    reg signed [31:0] s_ab [0:3];   // row r: sat_trunc(p[r,0]) + sat_trunc(p[r,1])
-    reg signed [31:0] s_cd [0:3];   // row r: sat_trunc(p[r,2]) + sat_trunc(p[r,3])
-
-    // Stage 3: Final 32-bit Output
-    reg signed [31:0] o [0:3];      // X', Y', Z', W'
-
-    // ========================================================================
-    // CLOCKED PIPELINE LOGIC
+    // HANDSHAKE: global stall, same as before
     // ========================================================================
     assign ready_out = ready_in; // Back-pressure propagation
 
-    integer i, r;
+    // valid bits: the only registers with a reset
+    reg [NST-1:0] val;
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            val <= {NST{1'b0}};
-        end else if (ready_in) begin
-            
-            // Push Valid Flags & Color through pipeline
-            val <= {val[NST-2:0], valid_in};
+        if (!rst_n)        val <= {NST{1'b0}};
+        else if (ready_in) val <= {val[NST-2:0], valid_in};
+    end
 
+    // ========================================================================
+    // DATAPATH (no reset -> DSP48E1 register packing)
+    // ========================================================================
+    reg [15:0]        col  [0:NST-1];
+    reg signed [63:0] p    [0:15];
+    reg signed [31:0] s_ab [0:3];   // row r: sat_trunc(p[r,0]) + sat_trunc(p[r,1])
+    reg signed [31:0] s_cd [0:3];   // row r: sat_trunc(p[r,2]) + sat_trunc(p[r,3])
+    reg signed [31:0] o    [0:3];   // X', Y', Z', W'
+
+    integer i, r;
+    always @(posedge clk) begin
+        if (ready_in) begin
+            // colour travels with the vertex, one register per stage
             col[0] <= in_C;
             for (i = 1; i < NST; i = i + 1) col[i] <= col[i-1];
 
@@ -143,7 +138,6 @@ module transform_engine (
             // ----------------------------------------------------------------
             for (r = 0; r < 4; r = r + 1)
                 o[r] <= sat_add(s_ab[r], s_cd[r]);
-
         end
     end
 
