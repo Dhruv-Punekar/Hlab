@@ -96,26 +96,21 @@ module transform_engine (
     reg [15:0]    col [0:NST-1];
 
     // Stage 1: 64-bit Multiplication Results
-    reg signed [63:0] pX0, pX1, pX2, pX3;
-    reg signed [63:0] pY0, pY1, pY2, pY3;
-    reg signed [63:0] pZ0, pZ1, pZ2, pZ3;
-    reg signed [63:0] pW0, pW1, pW2, pW3;
+    reg signed [63:0] p [0:15];
 
     // Stage 2: 32-bit Partial Sums
-    reg signed [31:0] sX_AB, sX_CD;
-    reg signed [31:0] sY_AB, sY_CD;
-    reg signed [31:0] sZ_AB, sZ_CD;
-    reg signed [31:0] sW_AB, sW_CD;
+    reg signed [31:0] s_ab [0:3];   // row r: sat_trunc(p[r,0]) + sat_trunc(p[r,1])
+    reg signed [31:0] s_cd [0:3];   // row r: sat_trunc(p[r,2]) + sat_trunc(p[r,3])
 
     // Stage 3: Final 32-bit Output
-    reg signed [31:0] out_X, out_Y, out_Z, out_W;
+    reg signed [31:0] o [0:3];      // X', Y', Z', W'
 
     // ========================================================================
     // CLOCKED PIPELINE LOGIC
     // ========================================================================
     assign ready_out = ready_in; // Back-pressure propagation
 
-    integer i;
+    integer i, r;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             val <= {NST{1'b0}};
@@ -130,33 +125,24 @@ module transform_engine (
             // ----------------------------------------------------------------
             // STAGE 1: 16 PARALLEL MULTIPLICATIONS (Infers DSP48E1 slices)
             // ----------------------------------------------------------------
-            pX0 <= in_X * M00;  pX1 <= in_Y * M01;  pX2 <= in_Z * M02;  pX3 <= in_W * M03;
-            pY0 <= in_X * M10;  pY1 <= in_Y * M11;  pY2 <= in_Z * M12;  pY3 <= in_W * M13;
-            pZ0 <= in_X * M20;  pZ1 <= in_Y * M21;  pZ2 <= in_Z * M22;  pZ3 <= in_W * M23;
-            pW0 <= in_X * M30;  pW1 <= in_Y * M31;  pW2 <= in_Z * M32;  pW3 <= in_W * M33;
+            p[0]  <= in_X * M00; p[1]  <= in_Y * M01; p[2]  <= in_Z * M02; p[3]  <= in_W * M03;
+            p[4]  <= in_X * M10; p[5]  <= in_Y * M11; p[6]  <= in_Z * M12; p[7]  <= in_W * M13;
+            p[8]  <= in_X * M20; p[9]  <= in_Y * M21; p[10] <= in_Z * M22; p[11] <= in_W * M23;
+            p[12] <= in_X * M30; p[13] <= in_Y * M31; p[14] <= in_Z * M32; p[15] <= in_W * M33;
 
             // ----------------------------------------------------------------
             // STAGE 2: SATURATION TRUNCATION & ADDER TREE STAGE 1
             // ----------------------------------------------------------------
-            sX_AB <= sat_add(sat_trunc(pX0), sat_trunc(pX1));
-            sX_CD <= sat_add(sat_trunc(pX2), sat_trunc(pX3));
-            
-            sY_AB <= sat_add(sat_trunc(pY0), sat_trunc(pY1));
-            sY_CD <= sat_add(sat_trunc(pY2), sat_trunc(pY3));
-            
-            sZ_AB <= sat_add(sat_trunc(pZ0), sat_trunc(pZ1));
-            sZ_CD <= sat_add(sat_trunc(pZ2), sat_trunc(pZ3));
-            
-            sW_AB <= sat_add(sat_trunc(pW0), sat_trunc(pW1));
-            sW_CD <= sat_add(sat_trunc(pW2), sat_trunc(pW3));
+            for (r = 0; r < 4; r = r + 1) begin
+                s_ab[r] <= sat_add(sat_trunc(p[r*4 + 0]), sat_trunc(p[r*4 + 1]));
+                s_cd[r] <= sat_add(sat_trunc(p[r*4 + 2]), sat_trunc(p[r*4 + 3]));
+            end
 
             // ----------------------------------------------------------------
             // STAGE 3: SATURATION ADDER TREE STAGE 2 (Final Transform)
             // ----------------------------------------------------------------
-            out_X <= sat_add(sX_AB, sX_CD);
-            out_Y <= sat_add(sY_AB, sY_CD);
-            out_Z <= sat_add(sZ_AB, sZ_CD);
-            out_W <= sat_add(sW_AB, sW_CD);
+            for (r = 0; r < 4; r = r + 1)
+                o[r] <= sat_add(s_ab[r], s_cd[r]);
 
         end
     end
@@ -164,7 +150,7 @@ module transform_engine (
     // ========================================================================
     // OUTPUT ASSIGNMENT
     // ========================================================================
-    assign vertex_out = {out_X, out_Y, out_Z, out_W, col[NST-1]};
+    assign vertex_out = {o[0], o[1], o[2], o[3], col[NST-1]};
     assign valid_out  = val[NST-1];
 
 endmodule
