@@ -37,16 +37,19 @@ module vertex_memory #(
     // SYNCHRONOUS MEMORY ACCESS
     // ========================================================================
     reg [WIDTH-1:0] ram_q;
+    reg             en_q = 1'b0;
 
     always @(posedge clk) begin
         if (en) begin
             // Write operation (Ignored for Phase 1 since we=0)
             if (we) begin
-                ram[addr] <= data_in; 
+                ram[addr] <= data_in;
             end
             ram_q <= ram[addr];
         end
-        data_out <= ram_q;
+        en_q <= en;
+        if (en_q)
+            data_out <= ram_q;
     end
 
 endmodule
