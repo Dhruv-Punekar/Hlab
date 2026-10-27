@@ -22,13 +22,12 @@ module transform_engine (
     output wire [143:0] vertex_out  // Transformed Vertex {X', Y', Z', W', RGB565}
 );
 
-    localparam NST = 3;             // pipeline stages
+    localparam NST = 5;             // pipeline stages S0..S4
 
     // ========================================================================
-    // COMBINATIONAL FUNCTIONS (Saturation Safety Nets)
+    // COMBINATIONAL FUNCTIONS (Saturation Safety Nets) - unchanged
     // ========================================================================
     // 1. Saturation Truncation (64-bit to 32-bit Q24.8)
-    // Prevents extreme scaling overflow from wrapping around the screen.
     function signed [31:0] sat_trunc;
         input signed [63:0] prod;
         begin
@@ -42,7 +41,6 @@ module transform_engine (
     endfunction
 
     // 2. Saturation Addition (32-bit + 32-bit)
-    // Prevents adding two massive numbers from flipping the sign bit.
     function signed [31:0] sat_add;
         input signed [31:0] a;
         input signed [31:0] b;
@@ -61,7 +59,7 @@ module transform_engine (
     // ========================================================================
     // HANDSHAKE: global stall, same as before
     // ========================================================================
-    assign ready_out = ready_in; // Back-pressure propagation
+    assign ready_out = ready_in;
 
     // valid bits: the only registers with a reset
     reg [NST-1:0] val;
