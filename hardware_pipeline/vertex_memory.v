@@ -34,7 +34,14 @@ module vertex_memory #(
     end
 
     // ========================================================================
-    // SYNCHRONOUS MEMORY ACCESS
+    // SYNCHRONOUS MEMORY ACCESS, 2-cycle registered read (timing fix 2026-10-27)
+    //   cycle 1 (en=1): ram_q    <= ram[addr]   -> BRAM output latch
+    //   cycle 2       : data_out <= ram_q        -> BRAM output register (DOREG)
+    // Without the second register, the BRAM clock-to-out (~2.5 ns) plus the
+    // route to the DSPs sat in front of the transform engine's 32x32 multiply
+    // and failed 100 MHz once the RAM grew to 4096 x 144 (16 RAMB36).
+    // data_out changes only on the cycle after an en=1 cycle, so it stays
+    // stable while the fetch FSM waits for the transform engine.
     // ========================================================================
     reg [WIDTH-1:0] ram_q;
     reg             en_q = 1'b0;
