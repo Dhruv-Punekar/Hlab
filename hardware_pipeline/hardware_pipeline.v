@@ -36,6 +36,9 @@
 //   render_done   1 when the vertex fetch has finished, the z-buffer clear is
 //                 done and every stage has been idle for 64 clocks.
 //
+// Background (2026-11-01): CLEAR_COLOR_TOP / CLEAR_COLOR_BOTTOM / CLEAR_SPLIT_Y
+//   give z_f_buffer a two-colour clear (e.g. sky / floor). Defaults = black.
+//
 // Depth path (2026-10-22 precision fix): projection z Q16.16 -> setup plane
 // Q14.18 (DEPTH_FRAC) -> rasterizer pixel_z Q6.9 (Z_FRAC_OUT) -> z_f_buffer.
 // ============================================================================
@@ -53,7 +56,13 @@ module hardware_pipeline #(
     // 2: opposite (front faces wound CLOCKWISE in vertices.mem)
     // Requires every triangle in vertices.mem to use the same winding, and a
     // matrix without a mirror (negative determinant flips the winding).
-    parameter CULL_MODE        = 1
+    parameter CULL_MODE        = 1,
+    // ---- background (z_f_buffer clear), RGB444 ----
+    // rows < CLEAR_SPLIT_Y clear to CLEAR_COLOR_TOP, the rest to CLEAR_COLOR_BOTTOM
+    // (defaults: plain black, as before)
+    parameter [11:0] CLEAR_COLOR_TOP    = 12'h000,
+    parameter [11:0] CLEAR_COLOR_BOTTOM = 12'h000,
+    parameter        CLEAR_SPLIT_Y      = 0
 )(
     input  wire       clk,        // 100 MHz
     input  wire       clk_vga,    // 25 MHz
@@ -343,8 +352,11 @@ module hardware_pipeline #(
     wire [11:0] vga_fb_color;
 
     z_f_buffer #(
-        .WIDTH  (300),
-        .HEIGHT (400)
+        .WIDTH              (300),
+        .HEIGHT             (400),
+        .CLEAR_COLOR_TOP    (CLEAR_COLOR_TOP),
+        .CLEAR_COLOR_BOTTOM (CLEAR_COLOR_BOTTOM),
+        .CLEAR_SPLIT_Y      (CLEAR_SPLIT_Y)
     ) u_z_f_buffer (
         .clk_render  (clk),
         .rst_n       (rst_n_r),

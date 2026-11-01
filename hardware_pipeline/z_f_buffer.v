@@ -15,13 +15,23 @@
 //   pixel_color still arrives as RGB565 (port unchanged), but it is converted
 //   to RGB444 as soon as it enters stage 1. The conversion is top-bit truncation
 //   R4 = c[15:12], G4 = c[10:7], B4 = c[4:1]
+//
+// Two-colour clear (2026-11-01, table-tennis scene): rows 0 .. CLEAR_SPLIT_Y-1
+// clear to CLEAR_COLOR_TOP, rows CLEAR_SPLIT_Y .. HEIGHT-1 to
+// CLEAR_COLOR_BOTTOM (e.g. sky above the horizon, floor below), so a large
+// background costs no rasterizer time. Defaults (both 12'h000) give the
+// original black clear.
 // ============================================================================
 
 module z_f_buffer #(
     parameter WIDTH = 300,
     parameter HEIGHT = 400,
     // Total pixels per buffer
-    parameter PIXELS = WIDTH * HEIGHT
+    parameter PIXELS = WIDTH * HEIGHT,
+    // clear colours (RGB444): TOP for rows < CLEAR_SPLIT_Y, BOTTOM for the rest
+    parameter [11:0] CLEAR_COLOR_TOP    = 12'h000,
+    parameter [11:0] CLEAR_COLOR_BOTTOM = 12'h000,
+    parameter        CLEAR_SPLIT_Y      = 0
 )(
     // Rasterizer Clock Domain
     input  wire        clk_render,
@@ -61,6 +71,8 @@ module z_f_buffer #(
 
     reg state;
     reg [18:0] clear_addr; // Large enough to count to 120,000
+    reg [9:0]  clear_x;    // column / row of clear_addr (two-colour clear)
+    reg [9:0]  clear_y;
 
     assign busy = (state == STATE_CLEAR);
     assign clear_done = (state == STATE_IDLE);
@@ -104,6 +116,8 @@ module z_f_buffer #(
         if (!rst_n) begin
             state <= STATE_CLEAR;
             clear_addr <= 0;
+            clear_x <= 0;
+            clear_y <= 0;
             s1_valid <= 0; s2_valid <= 0; s3_we <= 0; s4_we <= 0;
         end else begin
 
@@ -113,6 +127,12 @@ module z_f_buffer #(
             if (state == STATE_CLEAR) begin
                 // Wipe both Z and Color memories (write port below, mem_* = clear)
                 clear_addr <= clear_addr + 1;
+                if (clear_x == WIDTH - 1) begin
+                    clear_x <= 0;
+                    clear_y <= clear_y + 1;
+                end else begin
+                    clear_x <= clear_x + 1;
+                end
 
                 // Stop when we reach the end of the memory
                 if (clear_addr == PIXELS - 1) begin
@@ -187,7 +207,8 @@ module z_f_buffer #(
     wire        mem_we    = clearing | s3_we;
     wire [18:0] mem_addr  = clearing ? clear_addr  : s3_addr;
     wire [15:0] mem_z     = clearing ? 16'sh7FFF   : s3_z;      // far on clear
-    wire [11:0] mem_color = clearing ? 12'h000     : s3_color;  // black on clear
+    wire [11:0] clear_color = (clear_y < CLEAR_SPLIT_Y) ? CLEAR_COLOR_TOP : CLEAR_COLOR_BOTTOM;
+    wire [11:0] mem_color = clearing ? clear_color : s3_color;  // background on clear
 
     always @(posedge clk_render) begin
         s2_old_z <= z_buffer[s1_addr];                 // stage-2 read
