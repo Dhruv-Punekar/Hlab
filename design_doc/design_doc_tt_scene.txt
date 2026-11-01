@@ -1,0 +1,81 @@
+========================================================================
+TABLE-TENNIS DEMO SCENE - TECHNICAL NOTES  (step 1: static scene)
+========================================================================
+
+Files
+  mem_files/tt_game/gen_tt_scene.py     scene generator (Python)
+  mem_files/tt_game/vertices.mem        999 vertices (333 triangles), 1024 lines
+  mem_files/tt_game/matrix.mem          camera matrix (projection x view)
+  mem_files/tt_game/tt_scene_map.vh     counts, colours, horizon row, moving objects
+  mem_files/tt_game/scene_info.txt      generator report
+  mem_files/tt_game/preview.png         software render of the frame
+  mem_files/tt_game/expected_frame.png  RTL simulation frame (tb_tt_scene)
+  hardware_pipeline/tt_game_top_files/  tt_top.v (board top), tb_tt_scene.v,
+                                        constraints.xdc (same as cube_top)
+
+
+1. SCENE
+- Sky: light blue, floor: dark grey. Both are the framebuffer CLEAR
+  (z_f_buffer two-colour clear: rows above TT_HORIZON_Y = sky, below =
+  floor), so the large background costs no rasterizer time.
+- Floor grid: light grey lines on the floor plane up to 9 m behind the
+  table. Line width grows with distance so far lines stay ~1.6 px thick;
+  lines along the depth axis are split per 1 m cell to keep each
+  triangle's bounding box small. The grid's far edge is the horizon row.
+- Table: ITTF blue top with white side, end and centre lines (separate
+  non-overlapping quads, so no z-fighting), dark blue edge, dark legs.
+- Net: charcoal mesh (dark gaps + lighter strands side by side in one
+  plane), white top tape, grey posts.
+- Rackets: square blades (17 cm) with wooden edges and handles; player
+  (near) red, opponent (far) black for contrast against the floor/sky.
+- Ball: orange cube (7 cm, enlarged from 4 cm so it stays >= 5 px).
+  Orange contrasts with the blue table and the light sky; white would
+  merge with the table lines, net tape and sky.
+
+Colours are chosen in RGB444 and stored as RGB565 with the low bits zero,
+so the z_f_buffer truncation keeps them exactly.
+
+
+2. COORDINATES AND CAMERA
+- World units: 1 unit = 10 cm (Q24.8 resolves 0.4 mm). x right, y up,
+  z towards the camera; table centre on the floor at x = z = 0.
+- Camera at (0, 2.05, 3.55) m looking at (0, 0.45, -0.6) m, vertical FOV
+  52 deg, near 1 m, far 16 m, aspect 300/400. One matrix for everything.
+- No clipper in hardware: the generator clips every static triangle to
+  the screen (Sutherland-Hodgman against the frustum planes of the
+  quantised matrix, 0.4 % margin). Moving objects must stay on screen.
+- Static triangles facing away from the (fixed) camera are not stored.
+  Moving objects keep every face because they will turn later.
+- All triangles are wound counter-clockwise seen from the visible side
+  (CULL_MODE = 1).
+
+
+3. HARDWARE COST (RTL simulation, tb_tt_scene)
+- 333 triangles: 289 drawn, 22 back-facing, 22 zero-area at the 1/256 px
+  hardware precision (clip slivers, faces seen exactly edge-on;
+  discarded by design). 0 depth overflow, 0 off-screen.
+- Clear 1.20 ms + render 1.83 ms = 3.03 ms per frame. The VGA does not
+  read the framebuffer for 3.97 ms per frame (lines 440 .. 39), so a
+  full redraw per frame fits there (tear-free), with ~0.9 ms to spare.
+- Vertex memory: 1024 x 144 bit (~4 RAMB36). Keep the scene under 1024
+  vertices or VERTEX_DEPTH doubles.
+
+
+4. ROOM FOR MOTION (next steps)
+- Moving objects are stored last and contiguously in vertices.mem:
+  TT_RACKET_P_BASE/COUNT, TT_RACKET_O_*, TT_BALL_* in tt_scene_map.vh,
+  with their start centres (TT_*_X0/Y0/Z0, Q24.8 world units).
+- Options: rewrite those vertices through vertex_memory's write port
+  (tied off in hardware_pipeline today), or add per-object matrices.
+- Re-render each frame in the VGA window with rst_render_n, as cube_top
+  does (clear + render must stay under 3.97 ms).
+- Flicker / tearing and timing of the full design are separate later
+  steps.
+
+
+5. REGENERATING
+  python gen_tt_scene.py --out <folder>     (numpy + Pillow for preview.png)
+  Copy vertices.mem, matrix.mem and tt_scene_map.vh into the Vivado
+  project (with recip_lut_q1_17.mem). Check scene_info.txt: vertices
+  <= 1024 and frame total < 3.97 ms.
+========================================================================
