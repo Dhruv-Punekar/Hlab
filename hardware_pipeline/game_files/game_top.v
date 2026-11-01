@@ -99,7 +99,19 @@ module game_top #(
     always @(posedge clk_render or negedge mmcm_locked)
         if (!mmcm_locked) btn_sync <= 2'b00;
         else              btn_sync <= {btn_sync[0], CPU_RESETN};
-    wire rst_n = btn_sync[1];
+    // TIMING FIX: this reset goes to thousands of flip-flops. On normal
+    // routing it arrived late (reset "recovery" failure). It now comes from
+    // one more flip-flop and is carried on a BUFG (global buffer), which
+    // reaches every flip-flop with almost the same, small delay.
+    // Active-high inside the BUFG so the flip-flops' CLR pins are driven
+    // straight from it (no inverter after the buffer).
+    reg rst_hi = 1'b1;
+    always @(posedge clk_render or negedge mmcm_locked)
+        if (!mmcm_locked) rst_hi <= 1'b1;
+        else              rst_hi <= ~btn_sync[1];
+    wire rst_hi_g;
+    BUFG u_bufg_rst (.I(rst_hi), .O(rst_hi_g));
+    wire rst_n = ~rst_hi_g;
 
     // VGA-domain copy of the reset for color_theme
     (* ASYNC_REG = "TRUE" *) reg [1:0] rst_v_sync = 2'b00;
