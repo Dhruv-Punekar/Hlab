@@ -1,0 +1,13 @@
+# simulation / build outputs
+sim/build/
+sim/unit/
+sim/__pycache__/
+sim/*.log
+vivado/out/
+vivado/*.jou
+vivado/*.log
+vivado/.Xil/
+firmware/*.o
+firmware/firmware.elf
+firmware/firmware.bin
+firmware/firmware.dis
