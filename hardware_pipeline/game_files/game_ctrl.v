@@ -181,9 +181,75 @@ module game_ctrl #(
     endfunction
 
     // ---------------- per-frame update ---------------------------------------
-    reg signed [16:0] nx, ny, nd;                 // one extra bit for clamping
+    // TIMING FIX: the move/zoom update (zoom clamp -> limit table -> move
+    // clamp) was one long chain of adders, compares and a table lookup, about
+    // 13 ns, so it could not finish inside one 10 ns clock. It is now split
+    // into 3 short register stages (A, B, C) that run on EVERY clock. tx, ty
+    // and cam_dist only change on 'tick' (once per frame), so by the time the
+    // next tick comes the stages already hold the finished result, and the
+    // tick just copies it. The result is exactly the same as before; the
+    // buttons are only sampled 3 clocks (30 ns) earlier.
+
+    // ---- stage A: new distance (clamped) + un-clamped move ----
+    reg signed [16:0] a_nx, a_ny, a_nd;
+    reg               a_lim, a_r, a_l, a_u, a_d;
+    reg signed [16:0] nd;
     reg               lim;
-    reg signed [15:0] lx, ly;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            a_nx <= 17'sd0; a_ny <= 17'sd0; a_nd <= {DIST0[15], DIST0}; a_lim <= 1'b0;
+            a_r <= 1'b0; a_l <= 1'b0; a_u <= 1'b0; a_d <= 1'b0;
+        end else begin
+            nd = {cam_dist[15], cam_dist} - ((zoom_mode && btn_u) ? zstep : 16'sd0)
+                                          + ((zoom_mode && btn_d) ? zstep : 16'sd0);
+            lim = 1'b0;
+            if (nd <  DIST_MIN) begin nd =  DIST_MIN; lim = 1'b1; end
+            if (nd >  DIST_MAX) begin nd =  DIST_MAX; lim = 1'b1; end
+            a_nd  <= nd;
+            a_lim <= lim;
+            a_nx  <= {tx[15], tx} + ((move_mode && btn_r) ? mstep : 16'sd0)
+                                  - ((move_mode && btn_l) ? mstep : 16'sd0);
+            a_ny  <= {ty[15], ty} + ((move_mode && btn_u) ? mstep : 16'sd0)
+                                  - ((move_mode && btn_d) ? mstep : 16'sd0);
+            a_r <= move_mode && btn_r;  a_l <= move_mode && btn_l;
+            a_u <= move_mode && btn_u;  a_d <= move_mode && btn_d;
+        end
+    end
+
+    // ---- stage B: move limits for the NEW distance (table lookup) ----
+    reg signed [16:0] b_nx, b_ny, b_nd;
+    reg signed [15:0] b_lx, b_ly;
+    reg               b_lim, b_r, b_l, b_u, b_d;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            b_nx <= 17'sd0; b_ny <= 17'sd0; b_nd <= {DIST0[15], DIST0}; b_lim <= 1'b0;
+            b_lx <= 16'sd0; b_ly <= 16'sd0;
+            b_r <= 1'b0; b_l <= 1'b0; b_u <= 1'b0; b_d <= 1'b0;
+        end else begin
+            b_lx <= lim_x(a_nd[11:6] - DIST_MIN[11:6]);
+            b_ly <= lim_y(a_nd[11:6] - DIST_MIN[11:6]);
+            b_nx <= a_nx; b_ny <= a_ny; b_nd <= a_nd; b_lim <= a_lim;
+            b_r <= a_r; b_l <= a_l; b_u <= a_u; b_d <= a_d;
+        end
+    end
+
+    // ---- stage C: clamp the move to the limits ----
+    reg signed [16:0] c_nx, c_ny, c_nd;
+    reg               c_lim;
+    reg signed [16:0] nx, ny;
+    reg               limc;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            c_nx <= 17'sd0; c_ny <= 17'sd0; c_nd <= {DIST0[15], DIST0}; c_lim <= 1'b0;
+        end else begin
+            nx = b_nx; ny = b_ny; limc = b_lim;
+            if (nx >  b_lx) begin nx =  b_lx; limc = limc | b_r; end
+            if (nx < -b_lx) begin nx = -b_lx; limc = limc | b_l; end
+            if (ny >  b_ly) begin ny =  b_ly; limc = limc | b_u; end
+            if (ny < -b_ly) begin ny = -b_ly; limc = limc | b_d; end
+            c_nx <= nx; c_ny <= ny; c_nd <= b_nd; c_lim <= limc;
+        end
+    end
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -212,26 +278,9 @@ module game_ctrl #(
                              + (tilt_on ? tp_ang : 10'sd0);
                 roll_eff  <= tilt_on ? tr_ang : 10'd0;
 
-                // ---- move ----
-                nx = {tx[15], tx} + ((move_mode && btn_r) ? mstep : 16'sd0)
-                                  - ((move_mode && btn_l) ? mstep : 16'sd0);
-                ny = {ty[15], ty} + ((move_mode && btn_u) ? mstep : 16'sd0)
-                                  - ((move_mode && btn_d) ? mstep : 16'sd0);
-                // ---- zoom ----
-                nd = {cam_dist[15], cam_dist} - ((zoom_mode && btn_u) ? zstep : 16'sd0)
-                                              + ((zoom_mode && btn_d) ? zstep : 16'sd0);
-                lim = 1'b0;
-                if (nd <  DIST_MIN) begin nd =  DIST_MIN; lim = 1'b1; end
-                if (nd >  DIST_MAX) begin nd =  DIST_MAX; lim = 1'b1; end
-                // move limits for the NEW distance (zooming in pulls the cube inward)
-                lx = lim_x(nd[11:6] - DIST_MIN[11:6]);
-                ly = lim_y(nd[11:6] - DIST_MIN[11:6]);
-                if (nx >  lx) begin nx =  lx; lim = lim | (move_mode && btn_r); end
-                if (nx < -lx) begin nx = -lx; lim = lim | (move_mode && btn_l); end
-                if (ny >  ly) begin ny =  ly; lim = lim | (move_mode && btn_u); end
-                if (ny < -ly) begin ny = -ly; lim = lim | (move_mode && btn_d); end
-                tx <= nx[15:0]; ty <= ny[15:0]; cam_dist <= nd[15:0];
-                at_limit <= lim;
+                // ---- move + zoom: ready-made result from stages A..C ----
+                tx <= c_nx[15:0]; ty <= c_ny[15:0]; cam_dist <= c_nd[15:0];
+                at_limit <= c_lim;
             end
         end
     end
