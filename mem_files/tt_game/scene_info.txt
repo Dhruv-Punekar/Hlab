@@ -1,0 +1,11 @@
+Table-tennis scene
+triangles: 333 (307 drawn, 26 back-facing)  vertices: 999  VERTEX_DEPTH: 1024
+  static: 281 (+24 back-facing, not stored)  RACKET_P: 20  RACKET_O: 20  BALL: 12
+rasterizer cost: 190194 cycles = 1902 us (+ clear 1200 us)
+frame total ~3.10 ms  (VGA blanking window for tear-free redraw: 3.97 ms)
+horizon row: 114  sky (8, 12, 15)  floor (4, 4, 5) (RGB444)
+camera: pos (0.0, 2.05, 3.55) m, look-at (0.0, 0.45, -0.6) m, fov 52.0 deg, near 1.0 m, far 16.0 m
+moving objects (vertex base, count):
+  RACKET_P  base   843  count  60  centre (m) (0.3, 0.95, 1.55)
+  RACKET_O  base   903  count  60  centre (m) (-0.25, 1.0, -1.6)
+  BALL      base   963  count  36  centre (m) (0.1, 1.05, -0.55)
