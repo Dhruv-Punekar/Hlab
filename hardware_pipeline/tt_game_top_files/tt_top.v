@@ -2,57 +2,56 @@
 
 // ============================================================================
 // Module: tt_top   (board top, Nexys A7-100T, xc7a100tcsg324-1)
-//         Table-tennis demo scene, step 1: static scene.
+//         Table-tennis demo game.
 //
 //   CLK100MHZ -> MMCME2_BASE -> clk_render 100 MHz, clk_vga 25.175 MHz
-//   CPU_RESETN (red button) -> reset: background clear + one render
+//   CPU_RESETN (red button) -> full reset (score 0-0, P1 serves)
 //
-//   Scene (made by mem_files/tt_game/gen_tt_scene.py): sky + floor are the
-//   two-colour framebuffer clear (no rasterizer time), floor grid lines, blue
-//   table with white lines, net with posts, two rackets and an orange ball.
-//   ~333 triangles; clear 1.2 ms + render ~1.8 ms = ~3.0 ms, which fits the
-//   3.97 ms window in which the VGA does not read the framebuffer (lines 440
-//   .. 39), so a later per-frame redraw can be tear-free (see cube_top).
+//   Controls (two players on one board):
+//     P1, near end, red racket  : BTNR forehand   BTNL backhand
+//     P2, far end, black racket : BTNU forehand   BTND backhand
+//     The server serves with either of his buttons; the receiver returns with
+//     either. A return counts only if pressed in the timing window as the
+//     ball comes to the racket (see tt_game_core).
+//     BTNC: new game.   SW0 = P2 by computer, SW1 = P1 by computer.
+//   LEDs: LD0..3 buttons (P1 fore/back, P2 fore/back), LD12/13 server P1/P2,
+//         LD14 game over, LD15 render overrun (should never light).
+//   Score: panel in the top-right corner of the picture.
 //
 // Files to add to the Vivado project (design sources):
-//   vertices.mem          mem_files/tt_game  -> vertex_memory
-//   matrix.mem            mem_files/tt_game  -> matrix_memory (camera)
-//   recip_lut_q1_17.mem   mem_files          -> triangle_setup
-//   tt_scene_map.vh       mem_files/tt_game  -> included below (Verilog header)
+//   RTL : hardware_pipeline/*.v (pipeline), tt_game_top_files/tt_top.v,
+//         tt_game.v, tt_game_core.v, tt_obj_animator.v, tt_score_overlay.v,
+//         tt_buttons.v
+//   data: vertices.mem, matrix.mem, tt_scene_map.vh, tt_game_map.vh
+//         (mem_files/tt_game), recip_lut_q1_17.mem (mem_files)
+//   constraints: tt_game_top_files/constraints.xdc
 //   vertex_memory / matrix_memory load the fixed names "vertices.mem" and
-//   "matrix.mem": use a separate Vivado project for this demo (as for the
-//   cube and the picture).
-//
-// Motion (later steps): tt_scene_map.vh gives the vertex range and start
-// centre of each moving object (TT_RACKET_P_*, TT_RACKET_O_*, TT_BALL_*).
-// They are stored last in vertices.mem, so they can be moved by rewriting
-// those vertices through vertex_memory's write port (hardware_pipeline ties
-// it off today) or by a per-object matrix, then re-rendering in the VGA
-// window with rst_render_n, as cube_top does. The ports below are kept
-// identical to cube_top / image_top so the same XDC works unchanged.
-//
-// Constraints: the same XDC as cube_top (same ports, MMCM instance u_mmcm).
-// Needs hardware_pipeline.v with the CLEAR_COLOR_* / CLEAR_SPLIT_Y parameters.
+//   "matrix.mem": use a separate Vivado project for this demo.
 // ============================================================================
 module tt_top #(
     parameter RECIP_LUT_FILE = "recip_lut_q1_17.mem",
-    parameter Z_FRAC_OUT     = 9,
-    parameter CULL_MODE      = 1        // gen_tt_scene.py winds triangles CCW
+    parameter Z_FRAC_OUT     = 9
 )(
-    input  wire       CLK100MHZ,
-    input  wire       CPU_RESETN,       // red button, active low
+    input  wire        CLK100MHZ,
+    input  wire        CPU_RESETN,      // red button, active low
 
-    output wire [3:0] VGA_R,
-    output wire [3:0] VGA_G,
-    output wire [3:0] VGA_B,
-    output wire       VGA_HS,
-    output wire       VGA_VS
+    input  wire        BTNC,
+    input  wire        BTNU,
+    input  wire        BTNL,
+    input  wire        BTNR,
+    input  wire        BTND,
+    input  wire [1:0]  SW,
+    output wire [15:0] LED,
+
+    output wire [3:0]  VGA_R,
+    output wire [3:0]  VGA_G,
+    output wire [3:0]  VGA_B,
+    output wire        VGA_HS,
+    output wire        VGA_VS
 );
 
-`include "tt_scene_map.vh"
-
     // ========================================================================
-    // 1) CLOCKING: one MMCM -> 100 MHz render clock + 25.175 MHz pixel clock
+    // CLOCKING: one MMCM -> 100 MHz render clock + 25.175 MHz pixel clock
     //    VCO = 100 * 9 = 900 MHz; /35.75 = 25.1748 MHz; /9 = 100 MHz
     // ========================================================================
     wire clk_fb_out, clk_fb_in, clk_vga_unbuf, clk_render_unbuf;
@@ -88,43 +87,23 @@ module tt_top #(
     BUFG u_bufg_render (.I(clk_render_unbuf), .O(clk_render));
 
     // ========================================================================
-    // 2) RESET: button synchronised, MMCM lock as asynchronous reset
+    // THE GAME (reset synchronisers per clock domain are inside)
     // ========================================================================
-    (* ASYNC_REG = "TRUE" *) reg [1:0] btn_sync = 2'b00;
-    always @(posedge clk_render or negedge mmcm_locked)
-        if (!mmcm_locked) btn_sync <= 2'b00;
-        else              btn_sync <= {btn_sync[0], CPU_RESETN};
-    wire rst_n = btn_sync[1];
-
-    // ========================================================================
-    // 3) THE PIPELINE (draws the scene once after every reset)
-    // ========================================================================
-    wire render_done;   // high once the scene is complete (LED / ILA / motion sequencer)
-
-    hardware_pipeline #(
-        .NUM_VERTICES       (TT_NUM_VERTICES),
-        .VERTEX_DEPTH       (TT_VERTEX_DEPTH),
-        .RECIP_LUT_FILE     (RECIP_LUT_FILE),
-        .LOOP_RENDER        (0),
-        .Z_FRAC_OUT         (Z_FRAC_OUT),
-        .CULL_MODE          (CULL_MODE),
-        .CLEAR_COLOR_TOP    (TT_SKY_RGB444),     // sky
-        .CLEAR_COLOR_BOTTOM (TT_FLOOR_RGB444),   // floor
-        .CLEAR_SPLIT_Y      (TT_HORIZON_Y)       // far edge of the floor grid
-    ) u_pipeline (
-        .clk          (clk_render),
-        .clk_vga      (clk_vga),
-        .rst_n        (rst_n),
-        .rst_render_n (1'b1),           // step 1: no re-render yet (motion step)
-        .mat_we       (1'b0),           // camera matrix = matrix.mem
-        .mat_addr     (4'd0),
-        .mat_data     (32'd0),
-        .render_done  (render_done),
-        .vga_r        (VGA_R),
-        .vga_g        (VGA_G),
-        .vga_b        (VGA_B),
-        .vga_hs       (VGA_HS),
-        .vga_vs       (VGA_VS)
+    tt_game #(
+        .RECIP_LUT_FILE (RECIP_LUT_FILE),
+        .Z_FRAC_OUT     (Z_FRAC_OUT)
+    ) u_game (
+        .clk_render (clk_render),
+        .clk_vga    (clk_vga),
+        .arst_n     (CPU_RESETN & mmcm_locked),
+        .btn        ({BTNC, BTNU, BTNL, BTNR, BTND}),
+        .sw         (SW),
+        .led        (LED),
+        .vga_r      (VGA_R),
+        .vga_g      (VGA_G),
+        .vga_b      (VGA_B),
+        .vga_hs     (VGA_HS),
+        .vga_vs     (VGA_VS)
     );
 
 endmodule
