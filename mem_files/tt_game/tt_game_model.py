@@ -643,7 +643,9 @@ def check_sim(path):
     for line in open(path):
         t = line.split()
         if t[0] == "F":
-            cur = {"hdr": dict(zip(t[1::2], t[2::2])), "V": [], "F": int(t[1])}
+            import re
+            hdr = dict(re.findall(r"(\w+) (-?\d+(?: -?\d+)?)(?= [a-z_]+ |$)", line.strip()[2:]))
+            cur = {"hdr": hdr, "V": [], "F": int(t[1])}
             recs.append(cur)
         elif t[0] == "P":
             v = t[1:]
