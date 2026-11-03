@@ -1,82 +1,92 @@
 `timescale 1ns / 1ps
-
 // ============================================================================
 // Module: nav_top   (board top, Nexys A7-100T, xc7a100tcsg324-1)
-//         Street-View style navigation through the crossroads scene made by
-//         nav_scene.py. Same structure as cube_top: the pipeline is untouched
-//         except DISCARD_BEHIND = 1 (see hardware_pipeline.v).
+//         Walk around a small city (96 m x 96 m), game style, 60 frames/s.
 //
-//   Buttons (camera moves one 3 m cell per press, relative to the view):
-//     BTNU  forward        BTND  back
-//     BTNL  step left      BTNR  step right
-//     BTNC  turn right 90 deg (four presses = full look-around)
-//     CPU_RESETN (red)     back to the start pose
-//   A move into a building, tree, pond or off the map is refused (LED14 blinks).
+// CONTROLS (hold a button to keep going)
+//   BTNU / BTND   walk forward / back
+//   BTNL / BTNR   turn left / right          (SW1 up: step sideways instead)
+//   BTNC          snap to the nearest N / E / S / W  (handy for walking a road)
+//   SW0  up       run (double speed, double turn speed)
+//   SW14 up       hide the mini-map
+//   SW15          LED page (see below)
+//   CPU_RESETN    back to the start (red button)
 //
-//   LEDs:  [3:0] column   [7:4] row   [11:8] heading one-hot (N, E, S, W)
-//          [14] refused move (blinks ~0.3 s)   [15] rendering
+// WHAT YOU SEE
+//   middle : the 3D view (300 x 400), buildings/trees from the pipeline,
+//            sky and ground painted by nav_overlay
+//   right  : mini-map, red = you, yellow dots = where you look
+//   7-seg  : "XX-ZZ.HHH"  position x, z in metres and heading in degrees
+//   LEDs   : SW15 down  compass: one LED lit, LED15 = north, LED11 = east,
+//                       LED7 = south, LED3 = west (turn right -> light moves right)
+//            SW15 up    LED15..10 map column, LED9..4 map row (2 m cells),
+//                       LED3..2 where you look compared with where you last
+//                       walked (0 ahead, 1 right, 2 behind, 3 left),
+//                       LED1 bumped into something, LED0 frame heartbeat
+//   RGB LED16: green walking, blue turning, red bumped
 //
-//   How a press is shown (same sequencer as cube_top):
-//     1. the button sets the new pose (col, row, heading); it differs from the
-//        pose last drawn (ld_*), so a new view is pending
-//     2. at the next VGA blanking window (line 440) the render domain is held
-//        in reset and the 16 words of that pose are copied from nav_matrices.mem
-//        into matrix_memory
-//     3. release -> z/framebuffer clear (1.2 ms) -> the whole scene is drawn
-//        with the new matrix -> wait render_done
-//   Presses during a render update the pose; the latest pose is drawn next.
-//   No matrix arithmetic in hardware: every pose has a precomputed matrix.
+// FRAME LOOP (same idea as game_top)
+//   0. after a reset the start view is drawn at the first frame tick
+//   1. wait for the VGA frame tick (60 per second)
+//   2. nav_camera: read the buttons, move / turn, stop at walls, build the
+//      matrix (about 50 clocks)
+//   3. nothing changed -> back to 1 (the picture on the screen is still right)
+//   4. render domain in reset, 16 matrix words written, reset released
+//      -> clear + draw into the hidden buffer (DOUBLE_BUF = 1)
+//   5. render_done -> remember the pose of this picture for nav_overlay,
+//      ask buffer_swap to show it at the next vertical blanking
+//   6. swap_done -> back to 1
 //
-// Files (from nav_scene.py's output folder) -> add as design sources:
-//   vertices.mem        scene, NUM_VERTICES words padded to VERTEX_DEPTH
-//   matrix.mem          start pose (power-up render)
-//   nav_matrices.mem    GRID*GRID*4 poses x 16 words  -> mat_rom
-//   nav_walk.mem        GRID lines of GRID bits       -> walk_rom
-//   recip_lut_q1_17.mem reciprocal ROM (same file as for the cube)
-//   NUM_VERTICES / VERTEX_DEPTH / START_* must match scene_info.txt.
-//
-// BRAM: vertex RAM 2048 x 144 ~ 8, framebuffer ~45, z-buffer ~59,
-//       matrix ROM 4096 x 32 ~ 4, reciprocal ROMs ~1  ->  ~117 of 135.
-//
-// Constraints: nav_constraints.xdc (cube XDC + buttons + LEDs).
+// FILES
+//   new : nav_top.v, nav_camera.v, nav_overlay.v, hardware_pipeline_nav.v,
+//         nav_constraints.xdc
+//   from hardware_pipeline/game_files : btn_debounce.v, buffer_swap.v, seg7_driver.v
+//   from hardware_pipeline/           : the pipeline modules (vertex_memory,
+//         matrix_memory, transform_engine, projected_engine, triangle_setup_unit_bbox,
+//         rasterizer, z_f_buffer, vga_controller)  - hardware_pipeline.v not needed
+//   mem (nav_world.py): vertices.mem matrix.mem palette.mem nav_rot.mem
+//         nav_trig.mem nav_floor.mem nav_map.mem  + mem_files/recip_lut_q1_17.mem
+//   NUM_VERTICES etc. must match nav_mem/scene_info.txt.
 // ============================================================================
 module nav_top #(
-    parameter NUM_VERTICES    = 1584,   // scene_info.txt: NUM_VERTICES
-    parameter VERTEX_DEPTH    = 2048,   // scene_info.txt: VERTEX_DEPTH
-    parameter RECIP_LUT_FILE  = "recip_lut_q1_17.mem",
-    parameter Z_FRAC_OUT      = 9,
-    parameter CULL_MODE       = 1,      // nav_scene.py writes CCW faces
-    // ---- navigation ----
-    parameter MATRIX_FILE     = "nav_matrices.mem",
-    parameter WALK_FILE       = "nav_walk.mem",
-    parameter GRID            = 8,      // scene_info.txt: GRID (<= 16)
-    parameter START_COL       = 3,
-    parameter START_ROW       = 4,
-    parameter START_HEADING   = 0,      // 0=N 1=E 2=S 3=W
-    parameter DEBOUNCE_CLKS   = 1000000,// 10 ms at 100 MHz (use ~20 in simulation)
-    parameter TRIGGER_MODE    = 0       // 0: VGA window (board)  1: start at once (simulation)
+    parameter NUM_VERTICES   = 3450,     // scene_info.txt
+    parameter VERTEX_DEPTH   = 4096,
+    parameter RECIP_LUT_FILE = "recip_lut_q1_17.mem",
+    parameter PALETTE_FILE   = "palette.mem",
+    parameter CULL_MODE      = 1,        // nav_world.py writes counter-clockwise faces
+    // camera (scene_info.txt)
+    parameter START_X        = 139264,   // 1/4096 m  (34 m)
+    parameter START_Z        = 212992,   //           (52 m)
+    parameter START_H        = 0,        // north
+    parameter WALK_STEP      = 205,      // 3 m/s
+    parameter TURN_STEP      = 1,        // 84 deg/s
+    parameter RADIUS         = 4096,     // 1 m
+    parameter FOG_ROWS       = 8,
+    // board timing (the testbench makes these shorter)
+    parameter TRIGGER_MODE   = 0,        // 0: VGA frame tick  1: free-running (simulation)
+    parameter DEBOUNCE_CLKS  = 1000000,  // 10 ms
+    parameter SEG_REFRESH_BITS = 17
 )(
-    input  wire       CLK100MHZ,
-    input  wire       CPU_RESETN,       // red button, active low
+    input  wire        CLK100MHZ,
+    input  wire        CPU_RESETN,
 
-    input  wire       BTNC,
-    input  wire       BTNU,
-    input  wire       BTND,
-    input  wire       BTNL,
-    input  wire       BTNR,
-
+    input  wire        BTNC, BTNU, BTNL, BTNR, BTND,
+    input  wire [15:0] SW,
     output wire [15:0] LED,
+    output wire        LED16_R, LED16_G, LED16_B,
 
-    output wire [3:0] VGA_R,
-    output wire [3:0] VGA_G,
-    output wire [3:0] VGA_B,
-    output wire       VGA_HS,
-    output wire       VGA_VS
+    output wire [3:0]  VGA_R,
+    output wire [3:0]  VGA_G,
+    output wire [3:0]  VGA_B,
+    output wire        VGA_HS,
+    output wire        VGA_VS,
+
+    output wire [6:0]  SEG,
+    output wire        DP,
+    output wire [7:0]  AN
 );
-
     // ========================================================================
-    // 1) CLOCKING: one MMCM -> 100 MHz render clock + 25.175 MHz pixel clock
-    //    VCO = 100 * 9 = 900 MHz; /35.75 = 25.1748 MHz; /9 = 100 MHz
+    // 1) CLOCKS: 100 MHz render, 25.175 MHz VGA (same MMCM as the other tops)
     // ========================================================================
     wire clk_fb_out, clk_fb_in, clk_vga_unbuf, clk_render_unbuf;
     wire clk_vga, clk_render, mmcm_locked;
@@ -111,31 +121,96 @@ module nav_top #(
     BUFG u_bufg_render (.I(clk_render_unbuf), .O(clk_render));
 
     // ========================================================================
-    // 2) GLOBAL RESET: button synchronised, MMCM lock as asynchronous reset
+    // 2) RESET (as game_top: synchronised, then on a BUFG for timing)
     // ========================================================================
     (* ASYNC_REG = "TRUE" *) reg [1:0] btn_sync = 2'b00;
     always @(posedge clk_render or negedge mmcm_locked)
         if (!mmcm_locked) btn_sync <= 2'b00;
         else              btn_sync <= {btn_sync[0], CPU_RESETN};
-    wire rst_n = btn_sync[1];
+    reg rst_hi = 1'b1;
+    always @(posedge clk_render or negedge mmcm_locked)
+        if (!mmcm_locked) rst_hi <= 1'b1;
+        else              rst_hi <= ~btn_sync[1];
+    wire rst_hi_g;
+    BUFG u_bufg_rst (.I(rst_hi), .O(rst_hi_g));
+    wire rst_n = ~rst_hi_g;
+
+    (* ASYNC_REG = "TRUE" *) reg [1:0] rst_v_sync = 2'b00;    // VGA-clock copy
+    always @(posedge clk_vga or negedge rst_n)
+        if (!rst_n) rst_v_sync <= 2'b00;
+        else        rst_v_sync <= {rst_v_sync[0], 1'b1};
+    wire rst_v_n = rst_v_sync[1];
 
     // ========================================================================
-    // 3) THE PIPELINE
+    // 3) BUTTONS + SWITCHES (debounced)
+    // ========================================================================
+    wire [4:0]  btn;                     // {C, U, L, R, D}
+    wire [15:0] sw;
+    btn_debounce #(.N(5), .STABLE_CLKS(DEBOUNCE_CLKS)) u_db_btn (
+        .clk(clk_render), .rst_n(rst_n),
+        .raw({BTNC, BTNU, BTNL, BTNR, BTND}), .clean(btn));
+    btn_debounce #(.N(16), .STABLE_CLKS(DEBOUNCE_CLKS)) u_db_sw (
+        .clk(clk_render), .rst_n(rst_n), .raw(SW), .clean(sw));
+
+    wire key_c = btn[4];
+    wire key_u = btn[3];
+    wire key_l = btn[2];
+    wire key_r = btn[1];
+    wire key_d = btn[0];
+    wire sw_run = sw[0];
+    wire sw_strafe = sw[1];
+    wire sw_nomap = sw[14];
+    wire sw_ledpage = sw[15];
+
+    // BTNC: remember a press until the next frame uses it
+    reg key_c_q, snap_pending;
+
+    // ========================================================================
+    // 4) CAMERA
+    // ========================================================================
+    reg                cam_start;
+    wire               cam_done, cam_changed;
+    reg  [3:0]         ld_cnt;
+    wire [31:0]        cam_word;
+    wire signed [31:0] cam_x8, cam_z8;
+    wire [7:0]         cam_h, cam_walk_dir;
+    wire               cam_moving, cam_turning, cam_bumped;
+
+    nav_camera #(
+        .START_X(START_X), .START_Z(START_Z), .START_H(START_H),
+        .WALK_STEP(WALK_STEP), .TURN_STEP(TURN_STEP), .RADIUS(RADIUS)
+    ) u_cam (
+        .clk(clk_render), .rst_n(rst_n), .start(cam_start),
+        .key_fwd(key_u), .key_back(key_d), .key_left(key_l), .key_right(key_r),
+        .key_snap(snap_pending), .run(sw_run), .strafe(sw_strafe),
+        .done(cam_done), .changed(cam_changed),
+        .rd_addr(ld_cnt), .rd_data(cam_word),
+        .pos_x8(cam_x8), .pos_z8(cam_z8), .heading(cam_h), .walk_dir(cam_walk_dir),
+        .moving(cam_moving), .turning(cam_turning), .bumped(cam_bumped));
+
+    // ========================================================================
+    // 5) THE PIPELINE (double buffered, behind-camera triangles dropped)
     // ========================================================================
     reg         rst_render_n;
     reg         mat_we;
     reg  [3:0]  mat_addr;
     reg  [31:0] mat_data;
-    wire        render_done;
+    wire        render_done, stat_pixel;
+    wire [3:0]  pipe_r, pipe_g, pipe_b;
+    wire        pipe_hs, pipe_vs;
+    wire        front_r, show_buf;
 
-    hardware_pipeline #(
+    hardware_pipeline_nav #(
         .NUM_VERTICES   (NUM_VERTICES),
         .VERTEX_DEPTH   (VERTEX_DEPTH),
         .RECIP_LUT_FILE (RECIP_LUT_FILE),
         .LOOP_RENDER    (0),
-        .Z_FRAC_OUT     (Z_FRAC_OUT),
+        .Z_FRAC_OUT     (9),
         .CULL_MODE      (CULL_MODE),
-        .DISCARD_BEHIND (1)             // camera walks inside the scene
+        .DOUBLE_BUF     (1),
+        .INDEX_W        (4),
+        .PALETTE_FILE   (PALETTE_FILE),
+        .DISCARD_BEHIND (1)
     ) u_pipeline (
         .clk          (clk_render),
         .clk_vga      (clk_vga),
@@ -144,239 +219,214 @@ module nav_top #(
         .mat_we       (mat_we),
         .mat_addr     (mat_addr),
         .mat_data     (mat_data),
+        .draw_buf     (~front_r),       // always draw the hidden buffer
+        .show_buf     (show_buf),
+        .pal_we       (1'b0),
+        .pal_addr     (4'd0),
+        .pal_data     (12'h000),
         .render_done  (render_done),
-        .vga_r        (VGA_R),
-        .vga_g        (VGA_G),
-        .vga_b        (VGA_B),
-        .vga_hs       (VGA_HS),
-        .vga_vs       (VGA_VS)
+        .stat_pixel   (stat_pixel),
+        .vga_r        (pipe_r),
+        .vga_g        (pipe_g),
+        .vga_b        (pipe_b),
+        .vga_hs       (pipe_hs),
+        .vga_vs       (pipe_vs)
     );
 
     // ========================================================================
-    // 4) BUTTONS: 2-FF synchroniser, debounce (stable for DEBOUNCE_CLKS),
-    //    one-clock pulse on the press edge. Order: {C, R, L, D, U}
+    // 6) BUFFER SWAP (from game_files)
     // ========================================================================
-    localparam DB_W = $clog2(DEBOUNCE_CLKS + 1);
-
-    wire [4:0] btn_raw = {BTNC, BTNR, BTNL, BTND, BTNU};
-    wire [4:0] btn_press;                 // one-clock pulses
-
-    genvar b;
-    generate
-        for (b = 0; b < 5; b = b + 1) begin : g_btn
-            (* ASYNC_REG = "TRUE" *) reg [1:0] s;
-            reg            stable;
-            reg            pulse;
-            reg [DB_W-1:0] cnt;
-            always @(posedge clk_render or negedge rst_n) begin
-                if (!rst_n) begin
-                    s <= 2'b00; stable <= 1'b0; pulse <= 1'b0; cnt <= {DB_W{1'b0}};
-                end else begin
-                    s     <= {s[0], btn_raw[b]};
-                    pulse <= 1'b0;
-                    if (s[1] == stable) begin
-                        cnt <= {DB_W{1'b0}};
-                    end else if (cnt == DEBOUNCE_CLKS - 1) begin
-                        cnt    <= {DB_W{1'b0}};
-                        stable <= s[1];
-                        pulse  <= s[1];           // rising edge of the clean level
-                    end else begin
-                        cnt <= cnt + 1'b1;
-                    end
-                end
-            end
-            assign btn_press[b] = pulse;
-        end
-    endgenerate
-
-    wire press_u = btn_press[0];
-    wire press_d = btn_press[1];
-    wire press_l = btn_press[2];
-    wire press_r = btn_press[3];
-    wire press_c = btn_press[4];
+    reg  swap_req;
+    wire swap_done, swap_busy;
+    buffer_swap u_swap (
+        .clk_r(clk_render), .rst_r_n(rst_n),
+        .swap_req(swap_req), .swap_done(swap_done), .swap_busy(swap_busy), .front_r(front_r),
+        .clk_v(clk_vga), .rst_v_n(rst_v_n), .vsync(pipe_vs), .show_buf(show_buf));
 
     // ========================================================================
-    // 5) POSE + WALKABLE MAP
+    // 7) SKY + GROUND + MINI-MAP on the way to the VGA pins
+    //    pic_* = pose of the picture being swapped in (set before swap_req,
+    //    unchanged until swap_done -> nav_overlay copies it at the swap)
     // ========================================================================
-    localparam CW = (GRID <= 2) ? 1 : $clog2(GRID);   // col/row width
-    localparam [CW-1:0] COL0 = START_COL;
-    localparam [CW-1:0] ROW0 = START_ROW;
-    localparam [1:0]    HDG0 = START_HEADING;
+    reg signed [31:0] pic_x8, pic_z8;
+    reg        [7:0]  pic_h;
 
-    reg [GRID-1:0] walk_rom [0:GRID-1];               // bit c of row r = walkable
-    initial $readmemh(WALK_FILE, walk_rom);
+    (* ASYNC_REG = "TRUE" *) reg [1:0] nomap_v;
+    always @(posedge clk_vga) nomap_v <= {nomap_v[0], sw_nomap};
 
-    reg [CW-1:0] col, row;
-    reg [1:0]    heading;
-    reg [CW-1:0] ld_col, ld_row;                      // pose loaded / last drawn
-    reg [1:0]    ld_heading;
-    // new view needed when the pose differs from the one last drawn
-    wire dirty = (col != ld_col) || (row != ld_row) || (heading != ld_heading);
-
-    // direction of the requested step: forward = heading, right = heading+1,
-    // back = heading+2, left = heading+3   (0=N: row-1, 1=E: col+1, 2=S: row+1, 3=W: col-1)
-    wire       step_req = press_u | press_d | press_l | press_r;
-    wire [1:0] step_dir = heading + (press_u ? 2'd0 : press_r ? 2'd1 :
-                                     press_d ? 2'd2 : 2'd3);
-
-    // target cell, one bit wider so -1 and GRID can be detected
-    wire signed [CW+1:0] col_s = $signed({2'b00, col});
-    wire signed [CW+1:0] row_s = $signed({2'b00, row});
-    wire signed [CW+1:0] tcol  = (step_dir == 2'd1) ? col_s + 1 :
-                                 (step_dir == 2'd3) ? col_s - 1 : col_s;
-    wire signed [CW+1:0] trow  = (step_dir == 2'd2) ? row_s + 1 :
-                                 (step_dir == 2'd0) ? row_s - 1 : row_s;
-    wire in_map   = (tcol >= 0) && (tcol < GRID) && (trow >= 0) && (trow < GRID);
-    wire [CW-1:0] tcol_u = tcol[CW-1:0];
-    wire [CW-1:0] trow_u = trow[CW-1:0];
-    wire walkable = in_map && walk_rom[trow_u][tcol_u];
-
-    reg [24:0] refuse_cnt;                            // LED14: on ~0.17 s after a refused move
-
-    always @(posedge clk_render or negedge rst_n) begin
-        if (!rst_n) begin
-            col        <= COL0;
-            row        <= ROW0;
-            heading    <= HDG0;
-            refuse_cnt <= 25'd0;
-        end else begin
-            if (refuse_cnt != 25'd0) refuse_cnt <= refuse_cnt - 25'd1;
-            if (press_c) begin
-                heading <= heading + 2'd1;            // turn right 90 deg
-            end else if (step_req) begin
-                if (walkable) begin
-                    col   <= tcol_u;
-                    row   <= trow_u;
-                end else begin
-                    refuse_cnt <= {25{1'b1}};
-                end
-            end
-        end
-    end
+    nav_overlay #(
+        .FOG_ROWS (FOG_ROWS),
+        .START_X8 (START_X >>> 4), .START_Z8 (START_Z >>> 4), .START_H (START_H)
+    ) u_overlay (
+        .clk(clk_vga), .rst_n(rst_v_n),
+        .in_r(pipe_r), .in_g(pipe_g), .in_b(pipe_b), .in_hs(pipe_hs), .in_vs(pipe_vs),
+        .show_buf(show_buf), .pose_x8(pic_x8), .pose_z8(pic_z8), .pose_h(pic_h),
+        .map_on(~nomap_v[1]),
+        .out_r(VGA_R), .out_g(VGA_G), .out_b(VGA_B), .out_hs(VGA_HS), .out_vs(VGA_VS));
 
     // ========================================================================
-    // 6) MATRIX ROM (nav_matrices.mem, GRID*GRID*4 poses x 16 words)
-    //    address = ((row*GRID + col)*4 + heading)*16 + k
-    // ========================================================================
-    localparam ROM_DEPTH = GRID * GRID * 4 * 16;
-    localparam ROM_AW    = $clog2(ROM_DEPTH);
-
-    (* rom_style = "block" *) reg [31:0] mat_rom [0:ROM_DEPTH-1];
-    initial $readmemh(MATRIX_FILE, mat_rom);
-
-    reg  [4:0]        ld_cnt;                         // 0..16
-    wire [ROM_AW-1:0] pose_idx = (ld_row * GRID + ld_col) * 4 + ld_heading;
-    wire [ROM_AW-1:0] rom_addr = pose_idx * 16 + ld_cnt[3:0];
-    reg  [31:0]       rom_q;
-    always @(posedge clk_render) rom_q <= mat_rom[rom_addr];
-
-    // ========================================================================
-    // 7) VGA WINDOW DETECTOR: pulse at line 440 (framebuffer no longer read)
-    //    vsync falls at line 490; the k-th hsync fall after it is line 489+k
-    //    (mod 525), so the 476th is line 440.  (same as cube_top)
+    // 8) VGA FRAME TICK: pulse at line 440, once per frame (as game_top)
     // ========================================================================
     (* ASYNC_REG = "TRUE" *) reg [2:0] vs_s, hs_s;
     reg [9:0] hs_count;
-    reg       win_start;
-
+    reg       frame_tick;
     always @(posedge clk_render or negedge rst_n) begin
         if (!rst_n) begin
-            vs_s <= 3'b111; hs_s <= 3'b111;
-            hs_count <= 10'd0; win_start <= 1'b0;
+            vs_s <= 3'b111; hs_s <= 3'b111; hs_count <= 10'd0; frame_tick <= 1'b0;
         end else begin
-            vs_s <= {vs_s[1:0], VGA_VS};
-            hs_s <= {hs_s[1:0], VGA_HS};
-            win_start <= 1'b0;
+            vs_s <= {vs_s[1:0], pipe_vs};
+            hs_s <= {hs_s[1:0], pipe_hs};
+            frame_tick <= 1'b0;
             if (vs_s[2] && !vs_s[1])
                 hs_count <= 10'd0;
             else if (hs_s[2] && !hs_s[1]) begin
                 hs_count <= hs_count + 10'd1;
-                if (hs_count + 10'd1 == 10'd476)
-                    win_start <= 1'b1;
+                if (hs_count + 10'd1 == 10'd476) frame_tick <= 1'b1;
             end
         end
     end
 
-    wire go = (TRIGGER_MODE == 1) ? 1'b1 : win_start;
-
     // ========================================================================
-    // 8) RENDER SEQUENCER (cube_top's, triggered by "dirty" instead of a timer)
+    // 9) FRAME SEQUENCER
     // ========================================================================
-    localparam S_BOOT = 3'd0,   // power-up render (matrix.mem = start pose)
-               S_IDLE = 3'd1,   // wait for a new pose + VGA window
-               S_LOAD = 3'd2,   // render domain in reset, copy 16 matrix words
-               S_REL  = 3'd3,   // release the render reset
-               S_RUN  = 3'd4;   // wait for render_done
+    localparam S_IDLE = 3'd1,   // wait for the frame tick
+               S_CAM  = 3'd2,   // nav_camera moves and builds the matrix
+               S_LOAD = 3'd3,   // render domain in reset, write 16 words
+               S_REL  = 3'd4,   // release the render reset
+               S_RUN  = 3'd5,   // wait for render_done
+               S_SWAP = 3'd6;   // wait until the new picture is on the screen
     reg [2:0]  state;
-    reg [31:0] frames_rendered;   // read by a testbench
+    reg [4:0]  wr_cnt;
+    reg        tick_pending;    // a frame tick came while we were busy
+    reg [31:0] frames;          // pictures drawn (LED0 heartbeat)
+    reg        first;           // after a reset: draw even if nothing moved
+
+    wire go = (TRIGGER_MODE == 1) ? 1'b1 : (tick_pending | frame_tick);
 
     always @(posedge clk_render or negedge rst_n) begin
         if (!rst_n) begin
-            state           <= S_BOOT;
-            rst_render_n    <= 1'b1;            // power-up render runs at once
-            mat_we          <= 1'b0;
-            mat_addr        <= 4'd0;
-            mat_data        <= 32'd0;
-            ld_cnt          <= 5'd0;
-            ld_col          <= COL0;            // = matrix.mem (power-up render)
-            ld_row          <= ROW0;
-            ld_heading      <= HDG0;
-            frames_rendered <= 32'd0;
+            state <= S_IDLE; rst_render_n <= 1'b0;     // render domain waits for a matrix
+            first <= 1'b1;
+            mat_we <= 1'b0; mat_addr <= 4'd0; mat_data <= 32'd0;
+            cam_start <= 1'b0; ld_cnt <= 4'd0; wr_cnt <= 5'd0;
+            swap_req <= 1'b0; tick_pending <= 1'b0; frames <= 32'd0;
+            key_c_q <= 1'b0; snap_pending <= 1'b0;
+            pic_x8 <= START_X >>> 4; pic_z8 <= START_Z >>> 4; pic_h <= START_H;
         end else begin
-            mat_we <= 1'b0;
+            mat_we    <= 1'b0;
+            cam_start <= 1'b0;
+            swap_req  <= 1'b0;
+            if (frame_tick) tick_pending <= 1'b1;
+
+            key_c_q <= key_c;
+            if (key_c && !key_c_q) snap_pending <= 1'b1;   // BTNC pressed
+
             case (state)
-                S_BOOT: if (render_done) begin
-                    frames_rendered <= frames_rendered + 32'd1;
-                    state <= S_IDLE;
+                S_IDLE: if (go) begin
+                    tick_pending <= 1'b0;
+                    cam_start    <= 1'b1;
+                    state        <= S_CAM;
                 end
-
-                S_IDLE: if (dirty && go) begin
-                    ld_col       <= col;            // snapshot the pose; a press after
-                    ld_row       <= row;            // this edge makes dirty = 1 again
-                    ld_heading   <= heading;
-                    rst_render_n <= 1'b0;           // stop + clear the render domain
-                    ld_cnt       <= 5'd0;
-                    state        <= S_LOAD;
+                S_CAM: if (cam_done) begin
+                    snap_pending <= 1'b0;                  // used in this frame
+                    if (cam_changed || first) begin
+                        rst_render_n <= 1'b0;              // stop + clear the render domain
+                        ld_cnt <= 4'd0; wr_cnt <= 5'd0;
+                        state  <= S_LOAD;
+                    end else
+                        state  <= S_IDLE;                  // nothing to redraw
                 end
-
-                // ROM read latency 1: word k is on rom_q when ld_cnt = k+1
-                // (ld_* settle on the S_IDLE->S_LOAD edge, so the first
-                //  address is valid from the first S_LOAD cycle)
                 S_LOAD: begin
-                    if (ld_cnt != 5'd0) begin
-                        mat_we   <= 1'b1;
-                        mat_addr <= ld_cnt[3:0] - 4'd1;
-                        mat_data <= rom_q;
-                    end
-                    if (ld_cnt == 5'd16) state <= S_REL;
-                    else                 ld_cnt <= ld_cnt + 5'd1;
+                    mat_we   <= 1'b1;
+                    mat_addr <= ld_cnt;
+                    mat_data <= cam_word;                  // word ld_cnt of the matrix
+                    ld_cnt   <= ld_cnt + 4'd1;
+                    wr_cnt   <= wr_cnt + 5'd1;
+                    if (wr_cnt == 5'd15) state <= S_REL;
                 end
-
-                S_REL: begin                    // last matrix write happens on this edge
+                S_REL: begin                               // last write lands on this edge
                     rst_render_n <= 1'b1;
+                    first        <= 1'b0;
                     state        <= S_RUN;
                 end
-
-                S_RUN: if (render_done) begin   // render_done is 0 while in reset
-                    frames_rendered <= frames_rendered + 32'd1;
-                    state <= S_IDLE;
+                S_RUN: if (render_done) begin
+                    frames   <= frames + 32'd1;
+                    pic_x8   <= cam_x8;                    // pose of this picture
+                    pic_z8   <= cam_z8;
+                    pic_h    <= cam_h;
+                    swap_req <= 1'b1;                      // show it at the next vblank
+                    state    <= S_SWAP;
                 end
-
+                S_SWAP: if (swap_done) state <= S_IDLE;
                 default: state <= S_IDLE;
             endcase
         end
     end
 
     // ========================================================================
-    // 9) LEDS
+    // 10) LEDS
     // ========================================================================
-    wire [3:0] col4 = col;   // zero-extended for GRID < 16
-    wire [3:0] row4 = row;
-    assign LED[3:0]   = col4;
-    assign LED[7:4]   = row4;
-    assign LED[11:8]  = 4'b0001 << heading;           // N, E, S, W
-    assign LED[13:12] = 2'b00;
-    assign LED[14]    = refuse_cnt[24];               // on for the first half of the timer
-    assign LED[15]    = (state != S_IDLE);
+    // "bumped" and "walking/turning" last a few frames so they can be seen
+    reg [3:0] bump_hold, move_hold, turn_hold;
+    always @(posedge clk_render or negedge rst_n) begin
+        if (!rst_n) begin
+            bump_hold <= 4'd0; move_hold <= 4'd0; turn_hold <= 4'd0;
+        end else if (cam_done) begin
+            bump_hold <= cam_bumped  ? 4'd15 : (bump_hold != 0 ? bump_hold - 4'd1 : 4'd0);
+            move_hold <= cam_moving  ? 4'd4  : (move_hold != 0 ? move_hold - 4'd1 : 4'd0);
+            turn_hold <= cam_turning ? 4'd4  : (turn_hold != 0 ? turn_hold - 4'd1 : 4'd0);
+        end
+    end
 
+    wire [5:0] cell_x = cam_x8[14:9];                  // 2 m cells (512 in Q24.8)
+    wire [5:0] cell_z = cam_z8[14:9];
+    wire [7:0] rel    = cam_h - cam_walk_dir + 8'd32;  // look direction vs. walk direction
+    wire [7:0]  h_c     = cam_h + 8'd8;                // centre each LED on its direction
+    wire [15:0] compass = 16'h8000 >> h_c[7:4];        // 16 sectors of 22.5 deg
+
+    assign LED = sw_ledpage ? {cell_x, cell_z, rel[7:6], (bump_hold != 0), frames[4]}
+                            : compass;
+
+    // RGB LED: dimmed to 1/8 (it is very bright)
+    reg [2:0] pwm = 3'd0;
+    always @(posedge clk_render) pwm <= pwm + 3'd1;
+    wire dim = (pwm == 3'd0);
+    assign LED16_R = dim && (bump_hold != 0);
+    assign LED16_G = dim && (move_hold != 0);
+    assign LED16_B = dim && (turn_hold != 0);
+
+    // ========================================================================
+    // 11) 7-SEGMENT: "XX-ZZ.HHH"  x, z in metres, heading in degrees
+    // ========================================================================
+    function [11:0] bcd3;                              // 0..999 -> 3 BCD digits
+        input [9:0] n;
+        reg [9:0] r;
+        reg [3:0] hd, td;
+        integer k;
+        begin
+            hd = 4'd0; td = 4'd0;
+            for (k = 1; k < 10; k = k + 1) if (n >= k * 100) hd = k;
+            r = n - hd * 100;
+            for (k = 1; k < 10; k = k + 1) if (r >= k * 10) td = k;
+            r = r - td * 10;
+            bcd3 = {hd, td, r[3:0]};
+        end
+    endfunction
+
+    wire [15:0] deg = cam_h * 16'd45;                  // heading * 360 / 256 = h * 45 / 32
+    reg  [11:0] bx, bz, bh;
+    always @(posedge clk_render) begin                 // registered: keeps timing easy
+        bx <= bcd3(cam_x8[17:8]);                      // metres
+        bz <= bcd3(cam_z8[17:8]);
+        bh <= bcd3(deg[14:5]);                         // degrees
+    end
+
+    // seg7_driver digit codes: 0..9, 10 blank, 14 '-'; digit 7 is the leftmost
+    wire [39:0] digits = {1'b0, bx[7:4], 1'b0, bx[3:0], 5'd14,
+                          1'b0, bz[7:4], 1'b0, bz[3:0],
+                          1'b0, bh[11:8], 1'b0, bh[7:4], 1'b0, bh[3:0]};
+
+    seg7_driver #(.REFRESH_BITS(SEG_REFRESH_BITS)) u_seg7 (
+        .clk(clk_render), .rst_n(rst_n), .digits(digits), .dp(8'b0000_1000),
+        .an(AN), .seg(SEG), .dp_n(DP));
 endmodule

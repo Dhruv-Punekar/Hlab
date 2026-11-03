@@ -20,6 +20,7 @@
 //                              word order: M33 first ... M00 last, because
 //                              transform_engine reads M00 from matrix_regs[15]
 //   recip_lut_q1_17.mem     -> triangle_setup    (1024 x 18-bit Q1.17)
+//   palette.mem             -> z_f_buffer        (only when DOUBLE_BUF = 1)
 //
 // Signed depth is handled inside z_f_buffer, so this level connects it directly.
 // Setup -> rasterizer: degenerate, depth-overflow and (CULL_MODE) back-facing
@@ -36,20 +37,42 @@
 //   render_done   1 when the vertex fetch has finished, the z-buffer clear is
 //                 done and every stage has been idle for 64 clocks.
 //
+// Double buffering (2026-11-02, used by game_top; see z_f_buffer.v):
+//   DOUBLE_BUF    0 (default): exactly the old single RGB444 framebuffer. The
+//                 new ports below are then unused and may be left unconnected,
+//                 so cube_top / image_top / nexys_a7_top need no change.
+//                 1: two 4-bit palette-index framebuffers.
+//   draw_buf      (render clock) buffer the pipeline draws into. Change it only
+//                 while rst_render_n = 0 or after render_done.
+//   show_buf      (VGA clock) buffer the monitor shows. Change it only during
+//                 vertical blanking (buffer_swap does this).
+//   pal_we/addr/data  (render clock) write the draw buffer's palette. Tie to 0
+//                 for now (prepared for lighting).
+//   stat_pixel    (render clock) 1 for every pixel the rasterizer hands to the
+//                 z-buffer (pixels inside visible triangles), for the
+//                 "pixels per frame" counter on the 7-segment display.
+//   With DOUBLE_BUF = 1 the VGA output stays black only until the FIRST frame
+//   has been drawn after a full reset (fb_ready). In the old mode it is black
+//   during every z-buffer clear, which is fine there because the clear happens
+//   while the screen is not being read.
+//
 // Depth path (2026-10-22 precision fix): projection z Q16.16 -> setup plane
 // Q14.18 (DEPTH_FRAC) -> rasterizer pixel_z Q6.9 (Z_FRAC_OUT) -> z_f_buffer.
 //
-// Behind-camera discard (2026-11-01, used by nav_top):
+// ---------------------------------------------------------------------------
+// NAVIGATION COPY (hardware_pipeline_nav, 2026-11-03)
+//   = hardware_pipeline.v of hardware_pipeline/ (double buffering, stat_pixel,
+//     first_frame_done) with ONE addition, renamed so both files can sit in
+//     the same Vivado project:
 //   DISCARD_BEHIND = 1 drops a triangle between projection and setup when any
-//   of its vertices had W' <= 0. projection_engine already marks such a vertex
-//   with x = y = 0x7FFFFFFF; until now that mark only raised setup's
-//   overflow_xy_range (ignored by the discard policy), so the vertex was
-//   clamped to the screen corner (300, 400) with z ~ 0 and the triangle was
-//   drawn as a large wrong-coloured wedge in front of everything. A static
-//   model (cube, picture) never has W' <= 0, so the default 0 keeps cube_top /
-//   image_top bit-identical. No other module changes; only this glue.
+//   of its vertices had W' <= 0 (at or behind the eye). projection_engine
+//   already marks such a vertex with x = y = 0x7FFFFFFF; without this the
+//   setup unit clamps it to the screen corner and the triangle is drawn as a
+//   big wrong wedge in front of everything. Only a camera that walks INSIDE
+//   the scene ever has such vertices; with the default 0 this file behaves
+//   exactly like hardware_pipeline.v.
 // ============================================================================
-module hardware_pipeline #(
+module hardware_pipeline_nav #(
     parameter NUM_VERTICES    = 36,     // vertices in vertices.mem (multiple of 3)
     parameter VERTEX_DEPTH    = 64,     // vertex_memory DEPTH
     parameter RECIP_LUT_FILE  = "recip_lut_q1_17.mem",
@@ -64,9 +87,12 @@ module hardware_pipeline #(
     // Requires every triangle in vertices.mem to use the same winding, and a
     // matrix without a mirror (negative determinant flips the winding).
     parameter CULL_MODE        = 1,
+    // ---- double buffering ----
+    parameter DOUBLE_BUF       = 0,     // 0: old single RGB444 buffer, 1: two palette-index buffers
+    parameter INDEX_W          = 4,     // palette index bits (16 colours)
+    parameter PALETTE_FILE     = "palette.mem",
     // ---- behind-camera triangles (walk-through scenes) ----
-    // 1: drop triangles with a vertex at/behind the eye (W' <= 0)
-    parameter DISCARD_BEHIND   = 0
+    parameter DISCARD_BEHIND   = 0      // 1: drop triangles with a vertex at/behind the eye
 )(
     input  wire       clk,        // 100 MHz
     input  wire       clk_vga,    // 25 MHz
@@ -78,7 +104,15 @@ module hardware_pipeline #(
     input  wire [3:0]  mat_addr,
     input  wire [31:0] mat_data,
 
+    // double buffering (DOUBLE_BUF = 1 only; may be left unconnected otherwise)
+    input  wire               draw_buf,   // render clock
+    input  wire               show_buf,   // VGA clock
+    input  wire               pal_we,     // render clock
+    input  wire [INDEX_W-1:0] pal_addr,
+    input  wire [11:0]        pal_data,
+
     output wire       render_done,  // model drawn, pipeline idle
+    output wire       stat_pixel,   // one pixel sent to the z-buffer this clock
 
     output wire [3:0] vga_r,
     output wire [3:0] vga_g,
@@ -92,6 +126,7 @@ module hardware_pipeline #(
     // ========================================================================
     (* ASYNC_REG = "TRUE" *) reg [1:0] rst_sync_r = 2'b00;
     (* ASYNC_REG = "TRUE" *) reg [1:0] rst_sync_v = 2'b00;
+    (* ASYNC_REG = "TRUE" *) reg [1:0] rst_sync_f = 2'b00;
 
     wire rst_n_render_src = rst_n & rst_render_n;
 
@@ -103,8 +138,14 @@ module hardware_pipeline #(
         if (!rst_n) rst_sync_v <= 2'b00;
         else        rst_sync_v <= {rst_sync_v[0], 1'b1};
 
+    // render clock, FULL reset only (not the per-frame rst_render_n)
+    always @(posedge clk or negedge rst_n)
+        if (!rst_n) rst_sync_f <= 2'b00;
+        else        rst_sync_f <= {rst_sync_f[0], 1'b1};
+
     wire rst_n_r = rst_sync_r[1];   // render domain
     wire rst_n_v = rst_sync_v[1];   // VGA domain
+    wire rst_n_f = rst_sync_f[1];   // render domain, full reset only
 
     // ========================================================================
     // 1) VERTEX MEMORY + MATRIX MEMORY
@@ -221,19 +262,19 @@ module hardware_pipeline #(
     );
 
     // ------------------------------------------------------------------------
-    // Projection -> Setup handshake, with the behind-camera discard
-    //   behind  = some vertex carries the W' <= 0 mark (x = y = 0x7FFFFFFF)
-    //   setup.in_valid      = proj.valid_out && !drop
-    //   proj.ready_in       = setup.in_ready || drop   (dropped at once)
+    // Projection -> Setup handshake, with the behind-camera discard (NAV)
+    //   behind = some vertex carries the W' <= 0 mark (x = y = 0x7FFFFFFF)
+    //   setup.in_valid = proj.valid_out && !drop
+    //   proj.ready_in  = setup.in_ready || drop        (dropped at once)
     // pe_x*/pe_y* are registers inside projection_engine, so there is no
-    // combinational loop (ready_in only depends on registered outputs).
+    // combinational loop.
     // ------------------------------------------------------------------------
     localparam signed [31:0] BEHIND_MARK = 32'sh7FFF_FFFF;
     wire pe_behind = ((pe_x0 == BEHIND_MARK) && (pe_y0 == BEHIND_MARK)) ||
                      ((pe_x1 == BEHIND_MARK) && (pe_y1 == BEHIND_MARK)) ||
                      ((pe_x2 == BEHIND_MARK) && (pe_y2 == BEHIND_MARK));
-    wire pe_drop      = (DISCARD_BEHIND != 0) && pe_behind;
-    wire ts_in_valid  = pe_valid_out && !pe_drop;
+    wire pe_drop       = (DISCARD_BEHIND != 0) && pe_behind;
+    wire ts_in_valid   = pe_valid_out && !pe_drop;
     assign pe_ready_in = ts_in_ready || pe_drop;
 
     // ========================================================================
@@ -373,8 +414,11 @@ module hardware_pipeline #(
     wire [11:0] vga_fb_color;
 
     z_f_buffer #(
-        .WIDTH  (300),
-        .HEIGHT (400)
+        .WIDTH        (300),
+        .HEIGHT       (400),
+        .DOUBLE_BUF   (DOUBLE_BUF),
+        .INDEX_W      (INDEX_W),
+        .PALETTE_FILE (PALETTE_FILE)
     ) u_z_f_buffer (
         .clk_render  (clk),
         .rst_n       (rst_n_r),
@@ -389,11 +433,39 @@ module hardware_pipeline #(
         .clear_done  (zf_clear_done),
         .busy        (zf_busy),
 
+        .draw_buf    (draw_buf),
+        .pal_we      (pal_we),
+        .pal_addr    (pal_addr),
+        .pal_data    (pal_data),
+
         .clk_vga     (clk_vga),
         .vga_x       (vga_fb_x),
         .vga_y       (vga_fb_y),
+        .show_buf    (show_buf),
         .vga_color   (vga_fb_color)
     );
+
+    // pixels handed to the z-buffer (the same condition z_f_buffer uses to
+    // accept a pixel; out-of-screen pixels are counted too, there are none
+    // after the setup unit's bounding-box clamp)
+    assign stat_pixel = rs_pvalid && zf_ready;
+
+    // ========================================================================
+    // 6b) "FRAMEBUFFER HAS A PICTURE" flag for the VGA controller
+    //   DOUBLE_BUF = 1: the render domain is reset for every frame, so
+    //   zf_clear_done drops for every frame. That used to be invisible (the
+    //   clear ran while the screen was not read), but with double buffering
+    //   drawing happens while the monitor shows the OTHER buffer, so it would
+    //   black out the screen every frame. Instead the screen is enabled once
+    //   the first frame after a full reset is finished, and stays enabled.
+    //   DOUBLE_BUF = 0: unchanged (zf_clear_done).
+    // ========================================================================
+    reg first_frame_done;
+    always @(posedge clk or negedge rst_n_f) begin
+        if (!rst_n_f)         first_frame_done <= 1'b0;
+        else if (render_done) first_frame_done <= 1'b1;
+    end
+    wire fb_has_picture = (DOUBLE_BUF != 0) ? first_frame_done : zf_clear_done;
 
     // ========================================================================
     // 7) VGA CONTROLLER
@@ -408,7 +480,7 @@ module hardware_pipeline #(
     ) u_vga_controller (
         .clk_pix      (clk_vga),
         .rst_n        (rst_n_v),
-        .fb_ready     (zf_clear_done),   // CDC handled inside (2-FF sync)
+        .fb_ready     (fb_has_picture),  // CDC handled inside (2-FF sync)
         .fb_color     (vga_fb_color),
         .fb_x         (vga_fb_x),
         .fb_y         (vga_fb_y),
