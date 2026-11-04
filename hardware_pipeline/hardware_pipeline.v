@@ -56,6 +56,16 @@
 //   during every z-buffer clear, which is fine there because the clear happens
 //   while the screen is not being read.
 //
+// Background (2026-11-01, used by tt_top): CLEAR_COLOR_TOP / CLEAR_COLOR_BOTTOM /
+//   CLEAR_SPLIT_Y give z_f_buffer a two-colour clear (e.g. sky / floor) in the
+//   single-buffer mode. Defaults = black (old behaviour).
+//
+// Vertex write port (2026-11-01, used by tt_top for moving objects):
+//   VTX_WRITE_EN = 1 enables vtx_we / vtx_addr / vtx_data: one 144-bit vertex
+//   written into vertex_memory per clock. Write only while rst_render_n = 0
+//   (the vertex fetch is held in reset). With VTX_WRITE_EN = 0 (default) the
+//   ports are ignored and may be left unconnected; the memory works as before.
+//
 // Depth path (2026-10-22 precision fix): projection z Q16.16 -> setup plane
 // Q14.18 (DEPTH_FRAC) -> rasterizer pixel_z Q6.9 (Z_FRAC_OUT) -> z_f_buffer.
 // ============================================================================
@@ -77,7 +87,14 @@ module hardware_pipeline #(
     // ---- double buffering ----
     parameter DOUBLE_BUF       = 0,     // 0: old single RGB444 buffer, 1: two palette-index buffers
     parameter INDEX_W          = 4,     // palette index bits (16 colours)
-    parameter PALETTE_FILE     = "palette.mem"
+    parameter PALETTE_FILE     = "palette.mem",
+    // ---- background (z_f_buffer clear, single-buffer mode), RGB444 ----
+    // rows < CLEAR_SPLIT_Y clear to CLEAR_COLOR_TOP, the rest to CLEAR_COLOR_BOTTOM
+    parameter [11:0] CLEAR_COLOR_TOP    = 12'h000,
+    parameter [11:0] CLEAR_COLOR_BOTTOM = 12'h000,
+    parameter        CLEAR_SPLIT_Y      = 0,
+    // ---- vertex write port (moving objects) ----
+    parameter        VTX_WRITE_EN       = 0
 )(
     input  wire       clk,        // 100 MHz
     input  wire       clk_vga,    // 25 MHz
@@ -88,6 +105,12 @@ module hardware_pipeline #(
     input  wire        mat_we,
     input  wire [3:0]  mat_addr,
     input  wire [31:0] mat_data,
+
+    // vertex write port (VTX_WRITE_EN = 1; write while rst_render_n = 0;
+    // may be left unconnected otherwise)
+    input  wire         vtx_we,
+    input  wire [15:0]  vtx_addr,
+    input  wire [143:0] vtx_data,
 
     // double buffering (DOUBLE_BUF = 1 only; may be left unconnected otherwise)
     input  wire               draw_buf,   // render clock
@@ -141,15 +164,20 @@ module hardware_pipeline #(
     reg  [VADDR_W-1:0] vm_addr;
     wire [143:0]       vm_data;
 
+    // write port: constant 0 unless enabled, so unconnected ports are harmless
+    wire               vw_we   = (VTX_WRITE_EN != 0) ? vtx_we : 1'b0;
+    wire [VADDR_W-1:0] vm_port = vw_we ? vtx_addr[VADDR_W-1:0] : vm_addr;
+    wire [143:0]       vw_data = (VTX_WRITE_EN != 0) ? vtx_data : 144'd0;
+
     vertex_memory #(
         .DEPTH (VERTEX_DEPTH),
         .WIDTH (144)
     ) u_vertex_memory (
         .clk      (clk),
-        .en       (vm_en),
-        .we       (1'b0),
-        .addr     (vm_addr),
-        .data_in  (144'd0),
+        .en       (vm_en | vw_we),
+        .we       (vw_we),
+        .addr     (vm_port),
+        .data_in  (vw_data),
         .data_out (vm_data)
     );
 
@@ -386,7 +414,10 @@ module hardware_pipeline #(
         .HEIGHT       (400),
         .DOUBLE_BUF   (DOUBLE_BUF),
         .INDEX_W      (INDEX_W),
-        .PALETTE_FILE (PALETTE_FILE)
+        .PALETTE_FILE (PALETTE_FILE),
+        .CLEAR_COLOR_TOP    (CLEAR_COLOR_TOP),
+        .CLEAR_COLOR_BOTTOM (CLEAR_COLOR_BOTTOM),
+        .CLEAR_SPLIT_Y      (CLEAR_SPLIT_Y)
     ) u_z_f_buffer (
         .clk_render  (clk),
         .rst_n       (rst_n_r),

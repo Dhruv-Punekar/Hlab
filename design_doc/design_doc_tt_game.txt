@@ -1,0 +1,138 @@
+========================================================================
+TABLE-TENNIS DEMO - GAMEPLAY  (step 2: serve, rally, hit window, score)
+========================================================================
+
+Files
+  hardware_pipeline/tt_game_top_files/
+    tt_top.v             board top: MMCM (100 MHz render, 25.175 MHz pixel) + tt_game
+    tt_game.v            everything else: pipeline, game, animator, overlay, CDC
+    tt_game_core.v       game logic, one step per video frame (pixel clock)
+    tt_obj_animator.v    rewrites the racket / ball vertices (render clock)
+    tt_score_overlay.v   score panel on the VGA output, frame ticks
+    tt_buttons.v         button synchroniser, debounce, press events
+    constraints.xdc      pins (clock, reset, 5 buttons, SW0/SW1, LEDs, VGA)
+    tb_tt_game_core.v    game logic vs the Python model (bit-exact)
+    tb_tt_game.v         whole game with real clocks (renders, VGA capture)
+    tb_tt_scene.v        static scene (step 1), still valid
+  mem_files/tt_game/
+    tt_game_model.py     reference model + generator of tt_game_map.vh
+    tt_game_map.vh       game constants, swing tables, sin/cos, object ROM
+    vertices.mem, matrix.mem, tt_scene_map.vh   (unchanged from step 1)
+  hardware_pipeline/hardware_pipeline.v   new vertex write port (VTX_WRITE_EN)
+
+
+1. CONTROLS
+  P1, near end, red racket   : BTNR forehand   BTNL backhand
+  P2, far end, black racket  : BTNU forehand   BTND backhand
+  The server serves with either of his two buttons, the receiver returns
+  with either. Forehand / backhand only choose the swing animation.
+  BTNC        new game (score 0-0, the other player serves first)
+  CPU_RESETN  full reset (P1 serves first)
+  SW0 = 1     P2 played by the computer      SW1 = 1   P1 by the computer
+              (both on: demo mode; the computer misses 1 ball in 8)
+  LEDs        LD0..3 buttons, LD12 / LD13 P1 / P2 serves, LD14 game over,
+              LD15 render overrun (must stay off, see 5.)
+
+
+2. GAME RULES (simplified ITTF)
+  - Serve: the ball bobs in front of the server's racket until he presses.
+    It bounces once on the server's half, then once on the receiver's half.
+  - Return: the ball bounces once on the opponent's half.
+  - A return counts only if the button is pressed in the HIT WINDOW:
+    3 .. 16 frames (50 .. 267 ms) before the ball reaches the racket.
+    The swing then meets the ball (contact = 8 frames after the press, i.e.
+    between 133 ms before and 83 ms after the ball arrives) and the ball goes
+    back. Pressed too early, too late or not at all: the ball flies past
+    the racket, disappears and the point goes to the other player.
+  - Serve changes every 2 points, every point from 10-10.
+  - Game to 11, win by 2. At game over the winner's score blinks; BTNC
+    starts the next game.
+  - Ball and rackets stay close to the middle line (bounce x within +-12 cm).
+  All numbers are constants in tt_game_model.py (HIT_EARLY, HIT_LATE, arc
+  frames and heights, ...), regenerated into tt_game_map.vh.
+
+  Ball flight per shot: rally 30 frames to the bounce + 22 frames to the
+  racket = 0.87 s; serve 14 + 26 + 22 frames. Arcs are integer physics
+  (p += v, vy -= g per frame, Q16.16) aimed exactly at the bounce points;
+  the rally arc clears the net by ~15 cm, the serve by ~4.5 cm.
+
+  Swing animation: 24 frames (rest, back-swing, contact at frame 8,
+  follow-through, rest), racket moved and turned about the vertical axis.
+  Forehand on the player's right, backhand on his left. Idle rackets slide
+  sideways towards the incoming ball. The ball spins in flight.
+
+
+3. ARCHITECTURE
+
+  pixel clock 25.175 MHz                  render clock 100 MHz
+  tt_buttons  -> press events             render sequencer (tt_game.v)
+  tt_game_core  step at line 440 --pose bus + toggle-->  capture poses
+                (~30 clocks)                              rst_render_n = 0
+  tt_score_overlay <- pipeline VGA out                    tt_obj_animator:
+     score panel, line 440 / 40 ticks                     156 vertices, 1.6 us
+                                                          rst_render_n = 1:
+                                                          clear + render
+
+  - Moving objects: their vertices are stored last in vertices.mem (843 ..
+    998). Each frame the animator writes them again from the object ROM
+    (local coordinates) and the poses: X = tx + (cos lx + sin lz) >> 14,
+    Y = ty + ly, Z = tz + (cos lz - sin lx) >> 14. A hidden ball has all
+    vertices on one point (zero-area triangles are discarded by setup).
+  - hardware_pipeline: new parameter VTX_WRITE_EN and ports vtx_we /
+    vtx_addr / vtx_data (write while rst_render_n = 0). Default 0: the ports
+    are ignored and can stay unconnected; cube and picture demos render
+    bit-identically (checked).
+  - Score: drawn on the VGA output stream, not rendered, so it costs no
+    render time and cannot flicker. Panel at screen (398, 46), 66 x 26 px,
+    top-right of the picture; P1 red, P2 white, yellow bar under the server.
+
+
+4. TIMING / SLACK (design rules followed)
+  Render clock, 10 ns:
+  - Animator: 6 register stages, one operation each: distributed ROM read,
+    3:1 pose mux, 16x16 multiplies (DSP48 with input + output registers),
+    33-bit sum, 20-bit add, write registers. 4 DSP48E1.
+  - Vertex memory: one 2:1 LUT in front of the BRAM address (write port or
+    fetch address); write data straight from registers.
+  - Sequencer: small FSM.
+  Pixel clock, 39.7 ns:
+  - All game logic runs here: a step is a sequence of ~30 micro-steps, one
+    clock each, so no long combinational chains; the only multiplier (launch
+    velocity, 33 x 17 bit) has registered inputs and output.
+  - Overlay: 2 register stages (position decode, glyph + colour mux).
+  Clock-domain crossings: see tt_game.v header; set_clock_groups
+  -asynchronous between the two MMCM clocks, false paths on buttons /
+  switches / reset / LED / VGA ports (constraints.xdc).
+  Vivado check after implementation: report_timing_summary (WNS >= 0 on
+  both clocks) and report_cdc (the pose bus is a CE-controlled crossing).
+
+
+5. FRAME TIMING (no tearing)
+  The framebuffer is read on VGA lines 40 .. 439. At line 440 the game
+  steps and requests a render: animator 1.6 us + clear 1.2 ms + render
+  ~1.9 ms = ~3.1 ms, inside the 3.97 ms until line 40 (~0.85 ms spare,
+  worst case over all game poses from the model). LED15 latches if a
+  render is ever still running at line 40.
+  Resources added: no BRAM (vertex count unchanged, 999), ~6 DSP48, a few
+  hundred LUT/FF.
+
+
+6. VERIFICATION
+  - tt_game_model.py: runs computer-vs-computer, scripted-button,
+    40000-frame and deuce games; checks every pose on screen (>= 34 px
+    margin), worst render time, net clearance; writes golden logs.
+  - tb_tt_game_core.v: per-frame log identical to the model for all four
+    scenarios (52000 frames: serves, hits at the window edges, early /
+    late / missing presses, serve rotation, deuce to 20-20, game over,
+    new-game button, auto restart).
+  - animator test: 63 poses x 156 vertices bit-identical to the model.
+  - tb_tt_game.v: whole design with real clocks, serve by button: vertex
+    memory == model every frame, render finishes before line 40, score
+    panel on the VGA output.
+  - Regressions: static scene (tb_tt_scene) and cube frame unchanged.
+
+  Regenerate:
+    python tt_game_model.py --scene <folder with vertices.mem, matrix.mem,
+           tt_scene_map.vh> --out <folder> [--gif]
+    -> tt_game_map.vh, golden_*.log, rally_preview.gif
+========================================================================

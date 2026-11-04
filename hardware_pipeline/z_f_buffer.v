@@ -42,6 +42,12 @@
 //                 (Not used yet - tie pal_we to 0.)
 //     BRAM      : 2 x 120000 x 4 bits ~ 32 RAMB36 (old: 120000 x 12 ~ 48).
 //
+//   Two-colour clear (2026-11-01, table-tennis scene, DOUBLE_BUF = 0):
+//     rows 0 .. CLEAR_SPLIT_Y-1 clear to CLEAR_COLOR_TOP, the rest to
+//     CLEAR_COLOR_BOTTOM (e.g. sky above the horizon, floor below), so a large
+//     background costs no rasterizer time. Defaults (both 12'h000, split 0)
+//     give the original black clear. (DOUBLE_BUF = 1 keeps CLEAR_INDEX.)
+//
 //   The z-buffer and the whole 3-stage pipeline / forwarding logic are the
 //   same in both modes; only the width of the colour that travels with the
 //   pixel changes (12 bits or INDEX_W bits).
@@ -58,7 +64,11 @@ module z_f_buffer #(
     parameter INDEX_W      = 4,             // palette index bits (DOUBLE_BUF = 1)
     parameter PALETTE_FILE = "palette.mem", // 2^INDEX_W lines of RGB444 (3 hex digits)
     parameter COLOR_IN_IDX = 0,             // 1: pixel_color[INDEX_W-1:0] is already an index
-    parameter [INDEX_W-1:0] CLEAR_INDEX = 0 // background index written by the clear
+    parameter [INDEX_W-1:0] CLEAR_INDEX = 0, // background index written by the clear
+    // ---- two-colour clear, DOUBLE_BUF = 0 (RGB444) ----
+    parameter [11:0] CLEAR_COLOR_TOP    = 12'h000, // rows < CLEAR_SPLIT_Y
+    parameter [11:0] CLEAR_COLOR_BOTTOM = 12'h000, // rows >= CLEAR_SPLIT_Y
+    parameter        CLEAR_SPLIT_Y      = 0
 )(
     // Rasterizer Clock Domain
     input  wire        clk_render,
@@ -116,6 +126,8 @@ module z_f_buffer #(
 
     reg state;
     reg [18:0] clear_addr; // Large enough to count to 120,000
+    reg [9:0]  clear_x;    // column / row of clear_addr (two-colour clear)
+    reg [9:0]  clear_y;
 
     assign busy = (state == STATE_CLEAR);
     assign clear_done = (state == STATE_IDLE);
@@ -188,6 +200,8 @@ module z_f_buffer #(
         if (!rst_n) begin
             state <= STATE_CLEAR;
             clear_addr <= 0;
+            clear_x <= 0;
+            clear_y <= 0;
             s1_valid <= 0; s2_valid <= 0; s3_we <= 0; s4_we <= 0;
         end else begin
 
@@ -197,6 +211,12 @@ module z_f_buffer #(
             if (state == STATE_CLEAR) begin
                 // Wipe Z and the colour memory being drawn (write port below)
                 clear_addr <= clear_addr + 1;
+                if (clear_x == WIDTH - 1) begin
+                    clear_x <= 0;
+                    clear_y <= clear_y + 1;
+                end else begin
+                    clear_x <= clear_x + 1;
+                end
 
                 // Stop when we reach the end of the memory
                 if (clear_addr == PIXELS - 1) begin
@@ -255,7 +275,8 @@ module z_f_buffer #(
     wire          mem_we    = clearing | s3_we;
     wire [18:0]   mem_addr  = clearing ? clear_addr  : s3_addr;
     wire [15:0]   mem_z     = clearing ? 16'sh7FFF   : s3_z;      // far on clear
-    wire [CW-1:0] clr_color = DOUBLE_BUF ? CLEAR_INDEX : {CW{1'b0}};
+    wire [11:0]   clr_rgb   = (clear_y < CLEAR_SPLIT_Y) ? CLEAR_COLOR_TOP : CLEAR_COLOR_BOTTOM;
+    wire [CW-1:0] clr_color = DOUBLE_BUF ? CLEAR_INDEX : clr_rgb;
     wire [CW-1:0] mem_color = clearing ? clr_color   : s3_color;  // background on clear
 
     // z-buffer: identical to before (read-first, the distance-2 forwarding
