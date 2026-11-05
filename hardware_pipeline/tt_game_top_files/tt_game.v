@@ -31,9 +31,14 @@
 //   Controls: btn = {BTNC, BTNU, BTNL, BTNR, BTND}
 //     P1 (near, red racket):  BTNR forehand, BTNL backhand  (also serve)
 //     P2 (far, black racket): BTNU forehand, BTND backhand  (also serve)
-//     BTNC new game.  sw[0] = P2 by computer, sw[1] = P1 by computer.
-//   LEDs: 0..3 = P1 fore/back, P2 fore/back buttons, 12/13 = P1/P2 serves,
-//         14 = game over, 15 = render overrun (sticky).
+//     BTNC short press = next camera view, held 1 s = new game.
+//     sw[0] = P2 by computer, sw[1] = P1 by computer, sw[2] = P1 tilt aiming,
+//     sw[3] = mute, sw[4] = invert tilt, sw[5] = accelerometer Y axis.
+//   LEDs: 0..3 = P1 fore/back, P2 fore/back buttons, 4..11 = aim position
+//         (sw[2]) or camera view, 12/13 = P1/P2 serves, 14 = game over,
+//         15 = render overrun (sticky).
+//   Each frame: tt_view_loader writes the selected view's static scene and
+//   matrix, then tt_obj_animator writes the rackets and the ball.
 // ============================================================================
 module tt_game #(
     parameter RECIP_LUT_FILE = "recip_lut_q1_17.mem",
@@ -45,8 +50,18 @@ module tt_game #(
     input  wire        arst_n,          // async: button & MMCM locked
 
     input  wire [4:0]  btn,             // {C, U, L, R, D}, active high
-    input  wire [1:0]  sw,
+    input  wire [5:0]  sw,
     output wire [15:0] led,
+
+    // accelerometer (ADXL362, SPI)
+    output wire        acl_sclk,
+    output wire        acl_mosi,
+    input  wire        acl_miso,
+    output wire        acl_csn,
+
+    // audio
+    output wire        aud_pwm_o,       // 1 = release, 0 = drive low (tt_top makes it open-drain)
+    output wire        aud_sd,
 
     output wire [3:0]  vga_r,
     output wire [3:0]  vga_g,
@@ -73,9 +88,16 @@ module tt_game #(
     // ========================================================================
     reg          rst_render_n;
     wire         render_done;
-    wire         an_we;
-    wire [15:0]  an_addr;
-    wire [143:0] an_data;
+    wire         an_we, ld_we;
+    wire [15:0]  an_addr, ld_addr;
+    wire [143:0] an_data, ld_data;
+    wire         ld_mat_we;
+    wire [3:0]   ld_mat_addr;
+    wire [31:0]  ld_mat_data;
+    // vertex writes: view loader first, then animator (never at the same time)
+    wire         vw_we   = ld_we | an_we;
+    wire [15:0]  vw_addr = ld_we ? ld_addr : an_addr;
+    wire [143:0] vw_data = ld_we ? ld_data : an_data;
     wire [3:0]   p_r, p_g, p_b;
     wire         p_hs, p_vs;
 
@@ -95,12 +117,12 @@ module tt_game #(
         .clk_vga      (clk_vga),
         .rst_n        (rst_n_r),
         .rst_render_n (rst_render_n),
-        .mat_we       (1'b0),
-        .mat_addr     (4'd0),
-        .mat_data     (32'd0),
-        .vtx_we       (an_we),
-        .vtx_addr     (an_addr),
-        .vtx_data     (an_data),
+        .mat_we       (ld_mat_we),
+        .mat_addr     (ld_mat_addr),
+        .mat_data     (ld_mat_data),
+        .vtx_we       (vw_we),
+        .vtx_addr     (vw_addr),
+        .vtx_data     (vw_data),
         .render_done  (render_done),
         .vga_r        (p_r),
         .vga_g        (p_g),
@@ -130,29 +152,89 @@ module tt_game #(
         .level      (btn_level)
     );
 
-    (* ASYNC_REG = "TRUE" *) reg [1:0] sw_s1, sw_s2;
+    (* ASYNC_REG = "TRUE" *) reg [5:0] sw_s1, sw_s2;
     always @(posedge clk_vga or negedge rst_n_v)
-        if (!rst_n_v) begin sw_s1 <= 2'b00; sw_s2 <= 2'b00; end
-        else          begin sw_s1 <= sw;    sw_s2 <= sw_s1; end
+        if (!rst_n_v) begin sw_s1 <= 6'd0; sw_s2 <= 6'd0; end
+        else          begin sw_s1 <= sw;   sw_s2 <= sw_s1; end
     wire [1:0] auto_play = {sw_s2[0], sw_s2[1]};   // sw[0] -> P2, sw[1] -> P1
+    wire       tilt_on   = sw_s2[2];                // P1 aims with the board tilt
+    wire       mute      = sw_s2[3];
 
+    // ------------------------------------------------------------------------
+    // BTNC: short press = next camera view, hold 1 s = new game
+    // ------------------------------------------------------------------------
     wire        tick_440, tick_40;
+    reg  [1:0]  view;
+    reg  [6:0]  c_hold;               // frames BTNC has been held
+    reg         new_pend;             // new-game event for the core
+    always @(posedge clk_vga or negedge rst_n_v) begin
+        if (!rst_n_v) begin
+            view <= 2'd0;  c_hold <= 7'd0;  new_pend <= 1'b0;
+        end else begin
+            if (ev_clear && ev_mask[4]) new_pend <= 1'b0;
+            if (tick_440) begin
+                if (btn_level[4]) begin
+                    if (c_hold != 7'd127) c_hold <= c_hold + 7'd1;
+                    if (c_hold == 7'd59)  new_pend <= 1'b1;          // held 1 s
+                end else begin
+                    if (c_hold != 7'd0 && c_hold < 7'd60)            // short press released
+                        view <= (view == TT_NUM_VIEWS - 1) ? 2'd0 : view + 2'd1;
+                    c_hold <= 7'd0;
+                end
+            end
+        end
+    end
+
+    // ------------------------------------------------------------------------
+    // accelerometer -> P1 aim (bounce x)
+    // ------------------------------------------------------------------------
+    wire signed [11:0] acc_x, acc_y, acc_z;
+    wire               acc_valid, acc_ok;
+    adxl362_reader #(
+        .HALF_CLKS    (13),            // 25.175 MHz / 26 = 0.97 MHz SCLK
+        .POWERUP_CLKS (250000),        // 10 ms
+        .RESET_CLKS   (250000),
+        .POLL_CLKS    (250000)         // 100 reads / s
+    ) u_acl (
+        .clk (clk_vga), .rst_n (rst_n_v),
+        .sclk (acl_sclk), .mosi (acl_mosi), .miso (acl_miso), .cs_n (acl_csn),
+        .acc_x (acc_x), .acc_y (acc_y), .acc_z (acc_z),
+        .sample_valid (acc_valid), .id_ok (acc_ok)
+    );
+    wire [15:0] tilt_x;
+    wire [7:0]  aim_leds;
+    tt_tilt u_tilt (
+        .clk (clk_vga), .rst_n (rst_n_v),
+        .acc_x (acc_x), .acc_y (acc_y), .acc_valid (acc_valid),
+        .swap_axes (sw_s2[5]), .invert (sw_s2[4]),
+        .tilt_x (tilt_x), .aim_leds (aim_leds)
+    );
+
     wire [15:0] rp_x, rp_y, rp_z, ro_x, ro_y, ro_z, bl_x, bl_y, bl_z;
     wire [5:0]  rp_yaw, ro_yaw, bl_yaw;
     wire        bl_vis, req_toggle, server, winner, step_busy;
     wire [6:0]  score0, score1;
     wire [2:0]  gstate;
+    wire        snd_hit, snd_bounce, snd_point;
 
     tt_game_core u_core (
         .clk (clk_vga), .rst_n (rst_n_v), .frame_tick (tick_440),
-        .btn_fore (btn_pend[1:0]), .btn_back (btn_pend[3:2]), .btn_new (btn_pend[4]),
-        .auto_play (auto_play), .ev_clear (ev_clear), .ev_mask (ev_mask),
+        .btn_fore (btn_pend[1:0]), .btn_back (btn_pend[3:2]), .btn_new (new_pend),
+        .auto_play (auto_play), .tilt_en (tilt_on), .tilt_x (tilt_x),
+        .ev_clear (ev_clear), .ev_mask (ev_mask),
         .rp_x (rp_x), .rp_y (rp_y), .rp_z (rp_z), .rp_yaw (rp_yaw),
         .ro_x (ro_x), .ro_y (ro_y), .ro_z (ro_z), .ro_yaw (ro_yaw),
         .bl_x (bl_x), .bl_y (bl_y), .bl_z (bl_z), .bl_yaw (bl_yaw), .bl_vis (bl_vis),
         .req_toggle (req_toggle),
         .score0 (score0), .score1 (score1), .server (server), .state (gstate),
-        .winner (winner), .step_busy (step_busy)
+        .winner (winner), .step_busy (step_busy),
+        .snd_hit (snd_hit), .snd_bounce (snd_bounce), .snd_point (snd_point)
+    );
+
+    tt_sound u_sound (
+        .clk (clk_vga), .rst_n (rst_n_v),
+        .ev_hit (snd_hit), .ev_bounce (snd_bounce), .ev_point (snd_point),
+        .mute (mute), .aud_pwm_o (aud_pwm_o), .aud_sd (aud_sd)
     );
 
     tt_score_overlay u_overlay (
@@ -176,7 +258,8 @@ module tt_game #(
         end
     end
 
-    assign led = {overrun, gstate == 3'd4, server, ~server, 8'd0,
+    assign led = {overrun, gstate == 3'd4, server, ~server,
+                  tilt_on ? aim_leds : {6'd0, view},
                   btn_level[3], btn_level[1], btn_level[2], btn_level[0]};
 
     // ========================================================================
@@ -193,6 +276,16 @@ module tt_game #(
     reg [15:0] c_rp_x, c_rp_y, c_rp_z, c_ro_x, c_ro_y, c_ro_z, c_bl_x, c_bl_y, c_bl_z;
     reg [5:0]  c_rp_yaw, c_ro_yaw, c_bl_yaw;
     reg        c_bl_vis;
+    reg [1:0]  c_view;
+
+    reg  ld_start;
+    wire ld_done;
+    tt_view_loader u_view (
+        .clk (clk_render), .rst_n (rst_n_r), .start (ld_start), .view (c_view),
+        .vtx_we (ld_we), .vtx_addr (ld_addr), .vtx_data (ld_data),
+        .mat_we (ld_mat_we), .mat_addr (ld_mat_addr), .mat_data (ld_mat_data),
+        .done (ld_done)
+    );
 
     reg  an_start;
     wire an_busy, an_done;
@@ -209,6 +302,7 @@ module tt_game #(
     localparam R_BOOT = 3'd0,   // power-up render of vertices.mem
                R_IDLE = 3'd1,   // wait for a frame request
                R_ANIM = 3'd2,   // render domain in reset, animator writes
+               R_LOAD = 3'd5,   // render domain in reset, view loader writes
                R_REL  = 3'd3,   // release the render reset
                R_RUN  = 3'd4;   // clear + render
     reg [2:0]  rstate;
@@ -218,13 +312,15 @@ module tt_game #(
 
     always @(posedge clk_render or negedge rst_n_r) begin
         if (!rst_n_r) begin
-            rstate <= R_BOOT;  rst_render_n <= 1'b1;  an_start <= 1'b0;  rbusy_r <= 1'b0;
+            rstate <= R_BOOT;  rst_render_n <= 1'b1;  an_start <= 1'b0;  ld_start <= 1'b0;  rbusy_r <= 1'b0;
+            c_view <= 2'd0;
             frames_rendered <= 32'd0;  render_cycles <= 22'd0;  rcnt <= 22'd0;
             c_rp_x <= 16'd0; c_rp_y <= 16'd0; c_rp_z <= 16'd0; c_rp_yaw <= 6'd0;
             c_ro_x <= 16'd0; c_ro_y <= 16'd0; c_ro_z <= 16'd0; c_ro_yaw <= 6'd0;
             c_bl_x <= 16'd0; c_bl_y <= 16'd0; c_bl_z <= 16'd0; c_bl_yaw <= 6'd0; c_bl_vis <= 1'b0;
         end else begin
             an_start <= 1'b0;
+            ld_start <= 1'b0;
             if (rcnt != 22'h3FFFFF) rcnt <= rcnt + 22'd1;
             case (rstate)
                 R_BOOT: if (render_done)           // power-up render (not checked for overrun)
@@ -233,13 +329,18 @@ module tt_game #(
                     c_rp_x <= rp_x; c_rp_y <= rp_y; c_rp_z <= rp_z; c_rp_yaw <= rp_yaw;
                     c_ro_x <= ro_x; c_ro_y <= ro_y; c_ro_z <= ro_z; c_ro_yaw <= ro_yaw;
                     c_bl_x <= bl_x; c_bl_y <= bl_y; c_bl_z <= bl_z; c_bl_yaw <= bl_yaw; c_bl_vis <= bl_vis;
+                    c_view <= view;
                     rst_render_n <= 1'b0;
-                    an_start <= 1'b1;
+                    ld_start <= 1'b1;
                     rbusy_r  <= 1'b1;
                     rcnt     <= 22'd0;
+                    rstate   <= R_LOAD;
+                end
+                R_LOAD: if (ld_done) begin             // static scene + matrix of the view
+                    an_start <= 1'b1;
                     rstate   <= R_ANIM;
                 end
-                R_ANIM: if (an_done) rstate <= R_REL;
+                R_ANIM: if (an_done) rstate <= R_REL;  // rackets + ball
                 R_REL: begin
                     rst_render_n <= 1'b1;
                     rstate <= R_RUN;
