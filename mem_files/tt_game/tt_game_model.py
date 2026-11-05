@@ -75,7 +75,13 @@ W_LO = SW_CONTACT - HIT_LATE            # press accepted when tta in [W_LO, W_HI
 W_HI = SW_CONTACT + HIT_EARLY
 MISS_FRAMES = 10                        # ball keeps flying 10 frames past the racket, then hides
 SPIN = 3                                # ball yaw step per frame in flight
-TRACK_STEP = 0.012                      # idle racket follows the ball x (m / frame)
+TRACK_STEP = 0.010                      # idle racket follows the ball x (m / frame)
+TRACK_FAST = 0.04                       # P1 racket in tilt mode ("reaches the ball by itself")
+BASE_LIM = 0.45                         # racket base x stays within +-0.45 m
+REACH = 0.16                            # a press only hits if |racket base - ball x| <= REACH
+TILT_MAX = 0.45                         # tilt aiming: bounce x in +-0.45 m (clamped in tt_game)
+# tilt shot: bounce at the tilt x, the ball keeps its sideways direction after
+# the bounce: hit x = bx + (bx - contact x) * 5/16  (0.7 m / 2.3 m of travel)
 
 POINT_PAUSE = 50                        # frames between a point and the next serve
 SERVE_AUTO = 45                         # computer serves after this many frames
@@ -188,6 +194,8 @@ class Game:
         self.score = [0, 0]
         self.first_server = 0
         self.frame = 0
+        self.tilt_en, self.tilt_x = 0, 0
+        self.ev = [0, 0, 0]
         self.new_game(toggle=False)
 
     # -- helpers ------------------------------------------------------------
@@ -239,11 +247,15 @@ class Game:
         l = self.lfsr
         self.lfsr = (l >> 1) ^ (LFSR_TAPS if l & 1 else 0)
 
-    def pick_lateral(self):
-        """New bounce x / hit x / computer timing for the next incoming ball."""
+    def pick_lateral(self, hitter):
+        """New bounce x / hit x / computer timing for the next incoming ball.
+        P1 in tilt mode aims with the board: bounce x = tilt x."""
         l = self.lfsr
         self.bx = q16(BX[l & 7])
         self.hx = q16(BX[l & 7] + HXD[(l >> 3) & 3])
+        if hitter == 0 and self.tilt_en:
+            self.bx = self.tilt_x << 8
+            self.hx = self.bx + (((self.bx - self.p[0]) * 5) >> 4)
         miss = ((l >> 8) & 7) == 0
         self.ai_t = AI_MISS_T if miss else SW_CONTACT + AI_JIT[(l >> 5) & 7]
 
@@ -263,10 +275,13 @@ class Game:
         self.sw_frame[p] = 0
 
     # -- one frame ----------------------------------------------------------
-    def step(self, press, newgame=False, auto=(0, 0)):
-        """press[p] = (forehand, backhand) button events since the last frame."""
+    def step(self, press, newgame=False, auto=(0, 0), tilt=(0, 0)):
+        """press[p] = (forehand, backhand) button events since the last frame.
+        tilt = (P1 tilt mode on, tilt x in Q8.8 world units, already clamped)."""
         self.frame += 1
         self.lfsr_step()
+        self.tilt_en, self.tilt_x = tilt
+        self.ev = [0, 0, 0]                  # sounds: racket hit, table bounce, point
         if newgame:
             self.new_game()
             return self.poses()
@@ -312,7 +327,8 @@ class Game:
             srv = self.server
             if contact[srv]:
                 s = self.side(srv)
-                self.pick_lateral()
+                self.pick_lateral(srv)
+                self.ev[0] = 1
                 self.hitter = srv
                 self.recv = srv ^ 1
                 self.tta = ARC_C[A_SERVE1][0] + ARC_C[A_SERVE2][0] + ARC_C[A_TOHIT][0]
@@ -331,7 +347,7 @@ class Game:
                 if hit and not self.sw_act[r]:
                     self.start_swing(r, t)
                     self.swung = 1
-                    if W_LO <= self.tta <= W_HI:
+                    if W_LO <= self.tta <= W_HI and abs(self.base_x[r] - (self.hx >> 8)) <= q8(REACH):
                         self.recv_ok = 1
                     else:
                         self.miss = 1
@@ -340,7 +356,8 @@ class Game:
             # b) contact -> return
             if contact[r] and self.recv_ok:
                 s = self.side(r)
-                self.pick_lateral()
+                self.pick_lateral(r)
+                self.ev[0] = 1
                 self.hitter = r
                 self.recv = r ^ 1
                 self.tta = ARC_C[A_RALLY][0] + ARC_C[A_TOHIT][0]
@@ -359,9 +376,11 @@ class Game:
                     if self.arc_left == 0:
                         sr = self.side(self.recv)
                         if self.arc == A_SERVE1:
+                            self.ev[1] = 1
                             self.p = list(self.tgt)
                             self.launch(A_SERVE2, [self.bx, q16(Y_BOUNCE), sr * q16(Z_SERVE_B2)])
                         elif self.arc in (A_SERVE2, A_RALLY):
+                            self.ev[1] = 1
                             self.p = list(self.tgt)
                             self.launch(A_TOHIT, [self.hx, q16(Y_HIT), sr * q16(Z_HIT)])
                         else:
@@ -370,6 +389,7 @@ class Game:
             if self.miss and self.tta <= -MISS_FRAMES:
                 self.vis = 0
                 self.score[self.hitter] += 1
+                self.ev[2] = 1
                 self.state = S_POINT
                 self.wait = 0
 
@@ -378,15 +398,12 @@ class Game:
             self.wait += 1
             if self.wait == POINT_PAUSE:
                 a, b = self.score
-                if (a >= WIN_POINTS or b >= WIN_POINTS) and abs(a - b) >= 2:
+                if a >= WIN_POINTS or b >= WIN_POINTS:      # one game = first to 11
                     self.winner = 0 if a > b else 1
                     self.state = S_OVER
                 else:
                     n = a + b
-                    if a >= WIN_POINTS - 1 and b >= WIN_POINTS - 1:
-                        self.server = self.first_server ^ (n & 1)
-                    else:
-                        self.server = self.first_server ^ ((n >> 1) & 1)
+                    self.server = self.first_server ^ ((n >> 1) & 1)   # serve changes every 2 points
                     self.state = S_SERVE
                     self.reset_bob()
                     self.hold_ball()
@@ -401,10 +418,12 @@ class Game:
                 return self.poses()
 
         # racket base x follows the incoming ball while the racket is idle
-        step = q8(TRACK_STEP)
+        lim = q8(BASE_LIM)
         for p in (0, 1):
+            step = q8(TRACK_FAST) if (p == 0 and self.tilt_en) else q8(TRACK_STEP)
             if not self.sw_act[p]:
                 tgt = (self.hx >> 8) if (self.state == S_FLIGHT and p == self.recv and not self.miss) else 0
+                tgt = max(-lim, min(lim, tgt))
                 d = tgt - self.base_x[p]
                 if abs(d) <= step:
                     self.base_x[p] = tgt
@@ -427,19 +446,24 @@ class Game:
         r0, r1, b = self.poses()
         f = lambda t: " ".join(str(v) for v in t)
         return (f"{self.frame} st {self.state} sc {self.score[0]} {self.score[1]} srv {self.server} "
-                f"tta {self.tta} | P {f(r0)} | O {f(r1)} | B {f(b)}")
+                f"tta {self.tta} | P {f(r0)} | O {f(r1)} | B {f(b)} | E {f(self.ev)}")
 
 
 # ----------------------------------------------------------------------------
 # Scenarios
 # ----------------------------------------------------------------------------
-def run(frames, script=None, auto=(1, 1), newgame_at=()):
+def tilt_wave(k):
+    """Test tilt input for the 'tilt' scenario (same formula in tb_tt_game_core.v)."""
+    return ((k % 240) - 120) * 9
+
+
+def run(frames, script=None, auto=(1, 1), newgame_at=(), tilt=False):
     """script(frame, game) -> press [[f,b],[f,b]] or None."""
     g = Game()
     out = []
     for k in range(frames):
         press = script(k, g) if script else [[0, 0], [0, 0]]
-        g.step(press, newgame=(k in newgame_at), auto=auto)
+        g.step(press, newgame=(k in newgame_at), auto=auto, tilt=(1, tilt_wave(k)) if tilt else (0, 0))
         out.append((g.log_line(), g.poses(), g.state, list(g.score)))
     return g, out
 
@@ -463,10 +487,10 @@ def human_script(k, g, _n=[0]):
     return press
 
 
-def deuce_script(k, g):
+def rotation_script(k, g):
     """Both players by buttons: the server serves after 20 frames (P1 forehand,
     P2 backhand), the receiver never returns -> the server wins every point:
-    tests the serve rotation into and through deuce (10-10 and beyond)."""
+    tests the serve rotation (every 2 points) and the end of a game at 11."""
     press = [[0, 0], [0, 0]]
     if g.state == S_SERVE and g.wait == 20:
         press[g.server] = [1, 0] if g.server == 0 else [0, 1]
@@ -556,6 +580,10 @@ def write_vh(path, rom):
     a(f"localparam signed [31:0] TT_HOLD_Y    = {sd(q16(HOLD_Y))};")
     a(f"localparam signed [31:0] TT_BOB_STEP  = {sd(q16(BOB / BOB_HALF))};")
     a(f"localparam signed [15:0] TT_TRACK_STEP = {sd(q8(TRACK_STEP), 16)};   // Q8.8")
+    a(f"localparam signed [15:0] TT_TRACK_FAST = {sd(q8(TRACK_FAST), 16)};   // Q8.8, P1 in tilt mode")
+    a(f"localparam signed [15:0] TT_BASE_LIM   = {sd(q8(BASE_LIM), 16)};   // Q8.8, racket base x limit")
+    a(f"localparam signed [15:0] TT_REACH      = {sd(q8(REACH), 16)};   // Q8.8, hit only if |base - ball x| <= this")
+    a(f"localparam signed [15:0] TT_TILT_MAX   = {sd(q8(TILT_MAX), 16)};   // Q8.8, tilt aiming range")
     a("")
     a("// arcs: kind 1 SERVE1, 2 SERVE2, 3 RALLY, 4 TOHIT -> frames N, gravity g, 65536/N, g*(N-1)/2")
     for k in (A_SERVE1, A_SERVE2, A_RALLY, A_TOHIT):
@@ -696,18 +724,19 @@ def main():
     print(f"  rally : {arc_y_at_net(Z_HIT, Y_HIT, -Z_RALLY_B, Y_BOUNCE, A_RALLY) - net_top:+.3f}")
     print(f"  serve : {arc_y_at_net(Z_SERVE_B1, Y_BOUNCE, -Z_SERVE_B2, Y_BOUNCE, A_SERVE2) - net_top:+.3f}")
 
-    mq, lines = load_scene(args.scene)
-    vh = open(os.path.join(args.scene, "tt_scene_map.vh")).read()
-    n_static = int(vh.split("TT_RACKET_P_BASE = ")[1].split(";")[0])
-    stat = static_tris(lines, n_static)
+    # every camera view: its matrix and static triangles (built by gen_tt_scene)
+    views, _ = G.build_views()
+    mq, stat = views[0]["mq"], views[0]["static"]
 
     runs = {
         "auto": (run(args.frames, auto=(1, 1)), True),
         "human": (run(args.frames, script=human_script, auto=(0, 1)), True),
-        # long computer-vs-computer run: full games, deuce, game over, auto
+        # long computer-vs-computer run: full games, game over, auto
         # restart, plus a new-game button press at frame 700 (log only)
         "long": (run(args.long_frames, auto=(1, 1), newgame_at=(700,)), False),
-        "deuce": (run(6000, script=deuce_script, auto=(0, 0)), False),
+        "rotation": (run(4000, script=rotation_script, auto=(0, 0)), False),
+        # P1 computer-timed + tilt aiming (board tilt sweeps left/right), P2 computer
+        "tilt": (run(args.frames, auto=(1, 1), tilt=True), True),
     }
     ok = True
     for name, ((g, out), check) in runs.items():
@@ -717,21 +746,22 @@ def main():
         if not check:
             print(f"{name}: {len(out)} frames, final score {g.score}, games finished {overs} (log only)")
             continue
-        worst_m, worst_c, seen = 1e9, 0, set()
+        seen = set()
         for line, poses, st, sc in out:
-            key = tuple(poses[0]) + tuple(poses[1]) + tuple(poses[2])
-            if key in seen:
-                continue
-            seen.add(key)
-            m, c = check_frame(mq, stat, rom, poses)
-            worst_m = min(worst_m, m)
-            worst_c = max(worst_c, c)
-        t_ms = (worst_c + G.CLEAR_CYCLES) / G.F_CLK * 1e3
-        print(f"{name}: {len(out)} frames, final score {g.score}, unique poses {len(seen)}, "
-              f"min on-screen margin {worst_m:.1f} px, worst raster cost {worst_c} cyc "
-              f"-> ~{t_ms:.2f} ms with clear (gap 3.97 ms)")
-        if worst_m < 1.0 or t_ms > 3.6:
-            ok = False
+            seen.add(tuple(poses[0]) + tuple(poses[1]) + tuple(poses[2]))
+        for k, v in enumerate(views):
+            worst_m, worst_c = 1e9, 0
+            for key in seen:
+                poses = [key[0:5], key[5:10], key[10:15]]
+                m, c = check_frame(v["mq"], v["static"], rom, poses)
+                worst_m = min(worst_m, m)
+                worst_c = max(worst_c, c)
+            t_ms = (worst_c + G.CLEAR_CYCLES) / G.F_CLK * 1e3
+            print(f"{name} / view {k}: {len(out)} frames, final score {g.score}, unique poses {len(seen)}, "
+                  f"min on-screen margin {worst_m:.1f} px, worst raster cost {worst_c} cyc "
+                  f"-> ~{t_ms:.2f} ms with clear (gap 3.97 ms)")
+            if worst_m < 1.0 or t_ms > 3.6:
+                ok = False
     if args.gif:
         (g, out), _ = runs["auto"]
         sel = [(p, s) for _, p, _, s in out[:args.gif_frames]]
