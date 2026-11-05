@@ -1,5 +1,6 @@
 ========================================================================
-TABLE-TENNIS DEMO - GAMEPLAY  (step 2: serve, rally, hit window, score)
+TABLE-TENNIS DEMO - GAMEPLAY  (step 2: serve, rally, hit window, score;
+                               step 3: views, sound, tilt aiming - see 7.)
 ========================================================================
 
 Files
@@ -10,7 +11,11 @@ Files
     tt_obj_animator.v    rewrites the racket / ball vertices (render clock)
     tt_score_overlay.v   score panel on the VGA output, frame ticks
     tt_buttons.v         button synchroniser, debounce, press events
-    constraints.xdc      pins (clock, reset, 5 buttons, SW0/SW1, LEDs, VGA)
+    tt_view_loader.v     camera view: static scene + matrix per frame (step 3)
+    tt_sound.v           hit / bounce / point sounds, PWM audio (step 3)
+    tt_tilt.v            accelerometer -> P1 aim position (step 3)
+    constraints.xdc      pins (clock, reset, buttons, SW0..5, LEDs, VGA,
+                         accelerometer, audio)
     tb_tt_game_core.v    game logic vs the Python model (bit-exact)
     tb_tt_game.v         whole game with real clocks (renders, VGA capture)
     tb_tt_scene.v        static scene (step 1), still valid
@@ -26,11 +31,15 @@ Files
   P2, far end, black racket  : BTNU forehand   BTND backhand
   The server serves with either of his two buttons, the receiver returns
   with either. Forehand / backhand only choose the swing animation.
-  BTNC        new game (score 0-0, the other player serves first)
-  CPU_RESETN  full reset (P1 serves first)
+  BTNC        short press: next camera view (player 1 / side / player 2)
+              hold 1 s: new game (score 0-0, the other player serves first)
+  CPU_RESETN  full reset (P1 serves first, view player 1)
   SW0 = 1     P2 played by the computer      SW1 = 1   P1 by the computer
               (both on: demo mode; the computer misses 1 ball in 8)
-  LEDs        LD0..3 buttons, LD12 / LD13 P1 / P2 serves, LD14 game over,
+  SW2 = 1     P1 tilt aiming (see 7.)        SW3 = 1   mute
+  SW4 = 1     invert the tilt direction      SW5 = 1   use accelerometer Y
+  LEDs        LD0..3 buttons, LD4..11 aim position (SW2 on) or camera view,
+              LD12 / LD13 P1 / P2 serves, LD14 game over,
               LD15 render overrun (must stay off, see 5.)
 
 
@@ -39,15 +48,18 @@ Files
     It bounces once on the server's half, then once on the receiver's half.
   - Return: the ball bounces once on the opponent's half.
   - A return counts only if the button is pressed in the HIT WINDOW:
-    3 .. 16 frames (50 .. 267 ms) before the ball reaches the racket.
+    3 .. 16 frames (50 .. 267 ms) before the ball reaches the racket,
+    and only if the racket is within reach: |racket base x - ball x| <=
+    0.16 m (racket bases slide 1 cm per frame, limited to +-0.45 m).
     The swing then meets the ball (contact = 8 frames after the press, i.e.
     between 133 ms before and 83 ms after the ball arrives) and the ball goes
     back. Pressed too early, too late or not at all: the ball flies past
     the racket, disappears and the point goes to the other player.
-  - Serve changes every 2 points, every point from 10-10.
-  - Game to 11, win by 2. At game over the winner's score blinks; BTNC
-    starts the next game.
-  - Ball and rackets stay close to the middle line (bounce x within +-12 cm).
+  - Serve changes every 2 points.
+  - The first player to 11 points wins the game (no deuce). At game over
+    the winner's score blinks; BTNC held 1 s starts the next game.
+  - Without tilt aiming the ball stays close to the middle line (bounce x
+    within +-12 cm).
   All numbers are constants in tt_game_model.py (HIT_EARLY, HIT_LATE, arc
   frames and heights, ...), regenerated into tt_game_map.vh.
 
@@ -135,4 +147,54 @@ Files
     python tt_game_model.py --scene <folder with vertices.mem, matrix.mem,
            tt_scene_map.vh> --out <folder> [--gif]
     -> tt_game_map.vh, golden_*.log, rally_preview.gif
+
+
+7. STEP 3: CAMERA VIEWS, SOUND, TILT AIMING
+
+  Camera views (BTNC short press cycles them)
+    0 player 1  camera behind P1 (the original view)
+    1 side      camera at the side of the table, 6.8 m out
+    2 player 2  camera behind P2
+    All three use the same pitch and FOV, so the horizon is on the same row
+    (114) and the sky / floor clear split is unchanged. There is no clipper,
+    so each view has its own static scene (floor grid and pruning made for
+    its camera): gen_tt_scene.py writes them all to tt_views.mem
+    (3 x 1173 lines of {X, Y, Z, RGB565}, Q8.8) and the matrices to
+    tt_view_mat() in tt_scene_map.vh.
+    Each frame, while the render domain is held in reset, tt_view_loader
+    copies the selected view (static vertices 0 .. 1172 + 16 matrix words,
+    ~12 us), then tt_obj_animator writes the rackets and the ball after it
+    (1173 .. 1328). VERTEX_DEPTH is 2048; the view ROM is ~6 RAMB36.
+    Render time, worst case over all game poses: 3.12 / 2.41 / 2.62 ms
+    (gap 3.97 ms). Previews: preview.png, preview_view1.png, preview_view2.png.
+
+  Sound (tt_sound.v, pixel clock, no BRAM)
+    hit 1.3 kHz tock + noise click, bounce 820 Hz, point 523 Hz longer tone;
+    sine table + exponential envelope, 49.2 kHz samples, 8-bit PWM on
+    AUD_PWM (driven low or released, as Digilent specifies), AUD_SD = amp on.
+    Events come from tt_game_core (snd_hit / snd_bounce / snd_point).
+    SW3 mutes.
+
+  Tilt aiming (SW2, P1 only)
+    adxl362_reader (hardware_pipeline/game_files, clocked at 25.175 MHz:
+    ~1 MHz SPI, 100 samples/s) -> tt_tilt: low-pass, dead zone +-50 mg,
+    clamp +-400 mg, scaled to an aim x of up to +-0.39 m (TT_TILT_MAX).
+    With SW2 on:
+    - P1's serves and returns bounce at the aimed x on P2's half; the ball
+      keeps travelling sideways, so it reaches P2 at x + (x - P1 x) * 5/16.
+    - P1's racket follows the ball 4 cm per frame, so it is always there;
+      P1 only chooses the moment (button, or automatic with SW1 on).
+      SW1 + SW2: P1 fully automatic, direction by tilting the board.
+    - P2's racket (1 cm per frame, reach 0.16 m) can miss wide balls, so
+      aiming wins points.
+    LD4..11 show the aim position (LD11 = far left).
+
+  Verification (step 3)
+    - tt_game_model.py: auto, human, rotation and tilt runs, every pose on
+      screen in all three views, render time per view; long run 40000 frames.
+    - tb_tt_game_core.v: auto / human / rotation / tilt logs identical to
+      the model (scenarios 0, 1, 3, 4).
+    - tt_sound / tt_tilt unit test (sound decay to silence, tilt mapping).
+    - tb_tt_game.v: whole design, serve by button, BTNC switches to the side
+      view, renders finish before line 40.
 ========================================================================

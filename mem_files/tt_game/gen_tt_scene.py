@@ -364,15 +364,20 @@ def screen_xy(m, p):
     return (x / w + 1) * SCREEN_W / 2, (1 - y / w) * SCREEN_H / 2, w
 
 
-def floor_grid(m):
+def floor_grid(m, cam_z=None, far_z=None, half_x=None):
+    """Grid in the view's local frame (camera on +z looking to -z); m is the
+    local view matrix. Defaults = the original single camera."""
+    cam_z = CAM_POS[2] if cam_z is None else cam_z
+    far_z = FLOOR_FAR if far_z is None else far_z
     col = rgb444(*C["grid"])
     up = [0, 1, 0]
     tris = []
-    X = FLOOR_X * U
+    half_x = FLOOR_X if half_x is None else half_x
+    X = half_x * U
     step = GRID_STEP * U
     zs = []
-    z = math.floor(CAM_POS[2] * U / step) * step
-    while z >= FLOOR_FAR * U:
+    z = math.floor(cam_z * U / step) * step
+    while z >= far_z * U:
         zs.append(z)
         z -= step
     # lines across (constant z): thickness from the screen-space height of the line
@@ -384,7 +389,7 @@ def floor_grid(m):
         w = min(w, 0.25 * step)
         tris += quad([-X, 0, z + w / 2], [X, 0, z + w / 2], [X, 0, z - w / 2], [-X, 0, z - w / 2], col, up)
     # lines along z (constant x), split per cell, width grows with distance
-    xs = [i * step for i in range(-int(FLOOR_X / GRID_STEP), int(FLOOR_X / GRID_STEP) + 1)]
+    xs = [i * step for i in range(-int(half_x / GRID_STEP), int(half_x / GRID_STEP) + 1)]
     for x in xs:
         for za, zb in zip(zs[:-1], zs[1:]):
             wa = GRID_PX / max(abs(screen_xy(m, [x + 0.5, 0, za])[0] - screen_xy(m, [x - 0.5, 0, za])[0]), 1e-6)
@@ -461,6 +466,72 @@ def render_preview(scr, tris, horizon_y, path):
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Camera views. All views share the pitch and the field of view of the original
+# camera, so the horizon (sky / floor split of the background clear) stays on
+# the same screen row. Each view is described in a local frame (camera on +z,
+# looking towards -z) and turned about the vertical axis by k x 90 degrees.
+# The floor grid's far edge is placed so that it projects onto that same row.
+# ----------------------------------------------------------------------------
+GRID_X_SIDE = 7.0                                                    # side view: narrower grid (vertex budget)
+PITCH_T = (CAM_POS[1] - CAM_LOOK[1]) / (CAM_POS[2] - CAM_LOOK[2])   # tan(pitch) of view 0
+FAR_D0 = CAM_POS[2] - FLOOR_FAR                                      # floor depth seen by view 0
+
+
+def view_def(name, k, cam_d, look_z, grid_x=FLOOR_X, side_x=0.0):
+    """side_x moves the camera sideways in its own frame (view direction kept)."""
+    h = CAM_LOOK[1] + (cam_d - look_z) * PITCH_T
+    return dict(name=name, k=k, cam=(side_x, h, cam_d), look=(side_x, CAM_LOOK[1], look_z),
+                far_z=cam_d - FAR_D0 * h / CAM_POS[1], grid_x=grid_x)
+
+
+VIEWS = [
+    view_def("player 1 (near end)", 0, CAM_POS[2], CAM_LOOK[2]),   # = the original camera
+    view_def("side",                1, 6.8, 0.0, grid_x=GRID_X_SIDE, side_x=-0.45),
+    view_def("player 2 (far end)",  2, 4.6, CAM_LOOK[2]),
+]
+
+
+def rot_k(p, k):
+    """Local -> world: turn about +y by k x 90 degrees (k=1: local +z -> world +x)."""
+    x, y, z = p
+    for _ in range(k % 4):
+        x, z = z, -x
+    return [x, y, z]
+
+
+def build_views():
+    """Per view: quantised matrix, static triangles (clipped to that view,
+    back faces removed), horizon row. Shared: the moving objects."""
+    col = {k: rgb444(*v) for k, v in C.items()}
+    out = []
+    for v in VIEWS:
+        cam_w, look_w = rot_k(m2u(v["cam"]), v["k"]), rot_k(m2u(v["look"]), v["k"])
+        P = perspective(FOV_Y, SCREEN_W / SCREEN_H, NEAR * U, FAR * U)
+        M = mat_mul(P, look_at(cam_w, look_w))
+        mq = quantise_mat(M)
+        ML = mat_mul(P, look_at(m2u(v["cam"]), m2u(v["look"])))       # local frame, for the grid
+        grid = [tuple(rot_k(p, v["k"]) for p in t[:3]) + (t[3],) for t in floor_grid(ML, v["cam"][2], v["far_z"], v["grid_x"])]
+        planes = clip_planes(mq)
+        static_c = [t for tri in table() + net() + grid for t in clip_tri(tri, planes)]
+        scr_s, _, _, _ = analyse(mq, static_c)
+        static_c = [t for t, s_ in zip(static_c, scr_s) if s_ is not None]
+        far_c = rot_k([0, 0, v["far_z"] * U], v["k"])
+        horizon = int(round(to_screen(mq, far_c)[1]))
+        out.append(dict(v, M=M, mq=mq, static=static_c, horizon=max(0, min(SCREEN_H, horizon))))
+    objects = [("RACKET_P", *racket(RACKET_PLAYER, col["blade_red"])),
+               ("RACKET_O", *racket(RACKET_OPP, col["blade_black"])),
+               ("BALL", *ball(BALL_POS))]
+    return out, objects
+
+
+def to_q16(v):
+    raw = to_q(v)
+    if not -2**15 <= raw < 2**15:
+        raise ValueError(f"{v} does not fit Q8.8 (16 bit)")
+    return raw & 0xFFFF
+
+
 def main():
     ap = argparse.ArgumentParser(description="Generate the table-tennis scene .mem files.")
     ap.add_argument("--out", default="mem_out")
@@ -468,57 +539,54 @@ def main():
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
-    P = perspective(FOV_Y, SCREEN_W / SCREEN_H, NEAR * U, FAR * U)
-    V = look_at(m2u(CAM_POS), m2u(CAM_LOOK))
-    M = mat_mul(P, V)
-    mq = quantise_mat(M)
-    planes = clip_planes(mq)
-
-    col = {k: rgb444(*v) for k, v in C.items()}
-    static = table() + net() + floor_grid(M)
-    r_player, c_player = racket(RACKET_PLAYER, col["blade_red"])
-    r_opp, c_opp = racket(RACKET_OPP, col["blade_black"])
-    b_tris, c_ball = ball(BALL_POS)
-
-    # clip everything to the screen; moving objects must not need clipping
-    static_c = [t for tri in static for t in clip_tri(tri, planes)]
-    # the camera is fixed: static triangles facing away are always culled, so
-    # they are not stored (moving objects keep every face, they will turn)
-    scr_s, _, _, _ = analyse(mq, static_c)
-    n_static_back = sum(1 for s_ in scr_s if s_ is None)
-    static_c = [t for t, s_ in zip(static_c, scr_s) if s_ is not None]
-    objects = [("RACKET_P", r_player, c_player), ("RACKET_O", r_opp, c_opp), ("BALL", b_tris, c_ball)]
+    views, objects = build_views()
+    v0 = views[0]
     for name, tris, _ in objects:
-        clipped = [t for tri in tris for t in clip_tri(tri, planes)]
-        if len(clipped) != len(tris):
-            sys.exit(f"{name} is (partly) off screen at its start position")
+        for v in views:
+            if len([t for tri in tris for t in clip_tri(tri, clip_planes(v["mq"]))]) != len(tris):
+                sys.exit(f"{name} is (partly) off screen at its start position in view '{v['name']}'")
 
-    all_tris = list(static_c)
-    ranges = []
+    # every view's static set is padded to the same length with zero-area
+    # triangles (discarded by the setup unit); the moving objects follow
+    n_static = 3 * max(len(v["static"]) for v in views)
+    pad = ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0)
+    for v in views:
+        v["padded"] = v["static"] + [pad] * (n_static // 3 - len(v["static"]))
+    ranges, obj_tris = [], []
     for name, tris, centre in objects:
-        ranges.append((name, 3 * len(all_tris), 3 * len(tris), centre))
-        all_tris += tris
-
-    n_vert = 3 * len(all_tris)
+        ranges.append((name, n_static + 3 * len(obj_tris), 3 * len(tris), centre))
+        obj_tris += tris
+    n_vert = n_static + 3 * len(obj_tris)
     depth = 1 << max(6, math.ceil(math.log2(n_vert)))
-    scr, cost, culled, bad = analyse(mq, all_tris)
-    if bad:
-        sys.exit(f"{len(bad)} triangle(s) have vertices off screen / outside depth: {bad[:10]}")
 
-    # horizon row = projected far edge of the floor (same for every x)
-    horizon_y = int(round(to_screen(mq, [0, 0, FLOOR_FAR * U])[1]))
-    horizon_y = max(0, min(SCREEN_H, horizon_y))
+    info = ["Table-tennis scene"]
+    for k, v in enumerate(views):
+        all_tris = v["padded"] + obj_tris
+        scr, cost, culled, bad = analyse(v["mq"], all_tris)
+        if bad:
+            sys.exit(f"view {k}: {len(bad)} triangle(s) off screen / outside depth: {bad[:10]}")
+        v["scr"], v["all"] = scr, all_tris
+        info.append(f"view {k} ({v['name']}): static triangles {len(v['static'])}, horizon row {v['horizon']}, "
+                    f"raster cost {cost} cyc -> frame ~{(cost + CLEAR_CYCLES) / F_CLK * 1e3:.2f} ms (gap 3.97 ms); "
+                    f"camera {tuple(round(c, 2) for c in rot_k(v['cam'], v['k']))} m")
+    horizon_y = v0["horizon"]
+    if any(abs(v["horizon"] - horizon_y) > 1 for v in views):
+        sys.exit("views do not share the horizon row")
 
-    # ---- vertices.mem
-    lines = []
-    for a, b, c, cc in all_tris:
-        for p in (a, b, c):
-            lines.append(hex32(to_q(p[0])) + hex32(to_q(p[1])) + hex32(to_q(p[2])) + hex32(to_q(1.0)) + f"{cc:04x}")
+    # ---- vertices.mem (view 0, power-up) and matrix.mem (view 0)
+    def word144(p, cc):
+        return hex32(to_q(p[0])) + hex32(to_q(p[1])) + hex32(to_q(p[2])) + hex32(to_q(1.0)) + f"{cc:04x}"
+    lines = [word144(p, t[3]) for t in v0["all"] for p in t[:3]]
     lines += ["0" * 36] * (depth - len(lines))
     with open(os.path.join(args.out, "vertices.mem"), "w") as fh:
         fh.write("\n".join(lines) + "\n")
     with open(os.path.join(args.out, "matrix.mem"), "w") as fh:
-        fh.write("\n".join(matrix_words(M)) + "\n")
+        fh.write("\n".join(matrix_words(v0["M"])) + "\n")
+    # ---- tt_views.mem: static vertices of every view, {X, Y, Z Q8.8, RGB565}
+    vl = [f"{to_q16(p[0]):04x}{to_q16(p[1]):04x}{to_q16(p[2]):04x}{t[3]:04x}"
+          for v in views for t in v["padded"] for p in t[:3]]
+    with open(os.path.join(args.out, "tt_views.mem"), "w") as fh:
+        fh.write("\n".join(vl) + "\n")
 
     # ---- tt_scene_map.vh
     c12 = lambda k: "12'h%X%X%X" % C[k]
@@ -530,6 +598,8 @@ def main():
         f"localparam [11:0] TT_SKY_RGB444   = {c12('sky')};",
         f"localparam [11:0] TT_FLOOR_RGB444 = {c12('floor')};",
         f"localparam TT_HORIZON_Y = {horizon_y};      // first framebuffer row drawn in floor colour",
+        f"localparam TT_NUM_VIEWS = {len(views)};      // camera views (tt_views.mem, tt_view_mat)",
+        f"localparam TT_N_STATIC  = {n_static};    // static vertices per view (padded), at vertex 0",
         "// moving objects: first vertex, vertex count, start centre (Q24.8 world units, 1 unit = 10 cm)",
     ]
     for name, base, cnt, cen in ranges:
@@ -538,20 +608,21 @@ def main():
         vh.append(f"localparam signed [31:0] TT_{name}_X0 = {sv(cen[0])};  "
                   f"localparam signed [31:0] TT_{name}_Y0 = {sv(cen[1])};  "
                   f"localparam signed [31:0] TT_{name}_Z0 = {sv(cen[2])};")
+    vh.append("// camera matrix of view v, word i in matrix_memory order (word 0 = M33 ... word 15 = M00)")
+    vh.append("function [31:0] tt_view_mat;  input [1:0] v;  input [3:0] i;  begin")
+    vh.append("    case ({v, i})")
+    for k, v in enumerate(views):
+        for i, w in enumerate(matrix_words(v["M"])):
+            vh.append(f"        6'd{k * 16 + i}: tt_view_mat = 32'h{w};")
+    vh.append("        default: tt_view_mat = 32'h0;")
+    vh.append("    endcase  end endfunction")
     with open(os.path.join(args.out, "tt_scene_map.vh"), "w") as fh:
         fh.write("\n".join(vh) + "\n")
 
-    # ---- report
-    drawn = len(all_tris) - culled
-    render_us = cost / F_CLK * 1e6
-    info = [
-        "Table-tennis scene",
-        f"triangles: {len(all_tris)} ({drawn} drawn, {culled} back-facing)  vertices: {n_vert}  VERTEX_DEPTH: {depth}",
-        f"  static: {len(static_c)} (+{n_static_back} back-facing, not stored)  " + "  ".join(f"{n}: {c // 3}" for n, _, c, _ in ranges),
-        f"rasterizer cost: {cost} cycles = {render_us:.0f} us (+ clear {CLEAR_CYCLES / F_CLK * 1e6:.0f} us)",
-        f"frame total ~{(cost + CLEAR_CYCLES) / F_CLK * 1e3:.2f} ms  (VGA blanking window for tear-free redraw: 3.97 ms)",
+    info += [
+        f"vertices: {n_vert} ({n_static} static per view + {3 * len(obj_tris)} moving)  VERTEX_DEPTH: {depth}",
+        f"tt_views.mem: {len(vl)} x 64 bit",
         f"horizon row: {horizon_y}  sky {C['sky']}  floor {C['floor']} (RGB444)",
-        f"camera: pos {CAM_POS} m, look-at {CAM_LOOK} m, fov {FOV_Y} deg, near {NEAR} m, far {FAR} m",
         "moving objects (vertex base, count):",
     ] + [f"  {n:9s} base {b:5d}  count {c:3d}  centre (m) {tuple(round(v / U, 3) for v in cen)}" for n, b, c, cen in ranges]
     with open(os.path.join(args.out, "scene_info.txt"), "w") as fh:
@@ -560,8 +631,10 @@ def main():
 
     if not args.no_preview:
         try:
-            render_preview(scr, all_tris, horizon_y, os.path.join(args.out, "preview.png"))
-            print("preview.png written")
+            for k, v in enumerate(views):
+                render_preview(v["scr"], v["all"], horizon_y,
+                               os.path.join(args.out, "preview.png" if k == 0 else f"preview_view{k}.png"))
+            print("previews written")
         except ImportError:
             print("numpy/Pillow missing: no preview")
 

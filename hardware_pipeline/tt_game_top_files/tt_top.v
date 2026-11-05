@@ -10,19 +10,29 @@
 //   Controls (two players on one board):
 //     P1, near end, red racket  : BTNR forehand   BTNL backhand
 //     P2, far end, black racket : BTNU forehand   BTND backhand
-//     The server serves with either of his buttons; the receiver returns with
-//     either. A return counts only if pressed in the timing window as the
-//     ball comes to the racket (see tt_game_core).
-//     BTNC: new game.   SW0 = P2 by computer, SW1 = P1 by computer.
-//   LEDs: LD0..3 buttons (P1 fore/back, P2 fore/back), LD12/13 server P1/P2,
+//     Shots: the server serves with either of his buttons; the receiver returns
+//     with either. A return counts only if pressed in the timing window as the
+//     ball comes to the racket AND the racket is within reach (0.16 m) of it.
+//     BTNC: short press = next camera view (player 1 / side / player 2),
+//           hold 1 s = new game.
+//     SW0 = P2 by computer        SW1 = P1 by computer
+//     SW2 = P1 tilt aiming: P1's racket follows the ball quickly and the board
+//           tilt (accelerometer) decides where P1's shot lands.
+//           SW1+SW2 = fully automatic P1, aimed by tilting the board.
+//     SW3 = mute   SW4 = invert tilt   SW5 = use the accelerometer Y axis
+//   Rules: first to 11 points wins the game, serve changes every 2 points.
+//   Sound: hit / bounce / point on the audio jack (AUD_PWM).
+//   LEDs: LD0..3 buttons (P1 fore/back, P2 fore/back), LD4..11 aim position
+//         (SW2 on) or camera view (SW2 off), LD12/13 server P1/P2,
 //         LD14 game over, LD15 render overrun (should never light).
 //   Score: panel in the top-right corner of the picture.
 //
 // Files to add to the Vivado project (design sources):
 //   RTL : hardware_pipeline/*.v (pipeline), tt_game_top_files/tt_top.v,
 //         tt_game.v, tt_game_core.v, tt_obj_animator.v, tt_score_overlay.v,
-//         tt_buttons.v
-//   data: vertices.mem, matrix.mem, tt_scene_map.vh, tt_game_map.vh
+//         tt_buttons.v, tt_view_loader.v, tt_sound.v, tt_tilt.v,
+//         hardware_pipeline/game_files/adxl362_reader.v
+//   data: vertices.mem, matrix.mem, tt_views.mem, tt_scene_map.vh, tt_game_map.vh
 //         (mem_files/tt_game), recip_lut_q1_17.mem (mem_files)
 //   constraints: tt_game_top_files/constraints.xdc
 //   vertex_memory / matrix_memory load the fixed names "vertices.mem" and
@@ -40,8 +50,16 @@ module tt_top #(
     input  wire        BTNL,
     input  wire        BTNR,
     input  wire        BTND,
-    input  wire [1:0]  SW,
+    input  wire [5:0]  SW,
     output wire [15:0] LED,
+
+    output wire        ACL_SCLK,
+    output wire        ACL_MOSI,
+    input  wire        ACL_MISO,
+    output wire        ACL_CSN,
+
+    inout  wire        AUD_PWM,         // open drain: driven low or released
+    output wire        AUD_SD,
 
     output wire [3:0]  VGA_R,
     output wire [3:0]  VGA_G,
@@ -86,6 +104,9 @@ module tt_top #(
     BUFG u_bufg_vga    (.I(clk_vga_unbuf),    .O(clk_vga));
     BUFG u_bufg_render (.I(clk_render_unbuf), .O(clk_render));
 
+    wire aud_pwm_o;
+    assign AUD_PWM = aud_pwm_o ? 1'bz : 1'b0;
+
     // ========================================================================
     // THE GAME (reset synchronisers per clock domain are inside)
     // ========================================================================
@@ -99,6 +120,12 @@ module tt_top #(
         .btn        ({BTNC, BTNU, BTNL, BTNR, BTND}),
         .sw         (SW),
         .led        (LED),
+        .acl_sclk   (ACL_SCLK),
+        .acl_mosi   (ACL_MOSI),
+        .acl_miso   (ACL_MISO),
+        .acl_csn    (ACL_CSN),
+        .aud_pwm_o  (aud_pwm_o),
+        .aud_sd     (AUD_SD),
         .vga_r      (VGA_R),
         .vga_g      (VGA_G),
         .vga_b      (VGA_B),

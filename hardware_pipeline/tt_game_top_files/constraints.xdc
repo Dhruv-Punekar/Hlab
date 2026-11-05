@@ -20,9 +20,24 @@ set_property -dict { PACKAGE_PIN P17 IOSTANDARD LVCMOS33 } [get_ports { BTNL }];
 set_property -dict { PACKAGE_PIN M17 IOSTANDARD LVCMOS33 } [get_ports { BTNR }];
 set_property -dict { PACKAGE_PIN P18 IOSTANDARD LVCMOS33 } [get_ports { BTND }];
 
-## ---- Switches: SW0 = P2 by computer, SW1 = P1 by computer --------------------
+## ---- Switches: SW0 P2 computer, SW1 P1 computer, SW2 tilt aim, SW3 mute,
+##      SW4 invert tilt, SW5 accelerometer Y axis ---------------------------------
 set_property -dict { PACKAGE_PIN J15 IOSTANDARD LVCMOS33 } [get_ports { SW[0] }];
 set_property -dict { PACKAGE_PIN L16 IOSTANDARD LVCMOS33 } [get_ports { SW[1] }];
+set_property -dict { PACKAGE_PIN M13 IOSTANDARD LVCMOS33 } [get_ports { SW[2] }];
+set_property -dict { PACKAGE_PIN R15 IOSTANDARD LVCMOS33 } [get_ports { SW[3] }];
+set_property -dict { PACKAGE_PIN R17 IOSTANDARD LVCMOS33 } [get_ports { SW[4] }];
+set_property -dict { PACKAGE_PIN T18 IOSTANDARD LVCMOS33 } [get_ports { SW[5] }];
+
+## ---- Accelerometer (ADXL362, SPI) ---------------------------------------------
+set_property -dict { PACKAGE_PIN E15 IOSTANDARD LVCMOS33 } [get_ports { ACL_MISO }];
+set_property -dict { PACKAGE_PIN F14 IOSTANDARD LVCMOS33 } [get_ports { ACL_MOSI }];
+set_property -dict { PACKAGE_PIN F15 IOSTANDARD LVCMOS33 } [get_ports { ACL_SCLK }];
+set_property -dict { PACKAGE_PIN D15 IOSTANDARD LVCMOS33 } [get_ports { ACL_CSN }];
+
+## ---- Audio (mono PWM jack) ----------------------------------------------------
+set_property -dict { PACKAGE_PIN A11 IOSTANDARD LVCMOS33 } [get_ports { AUD_PWM }];
+set_property -dict { PACKAGE_PIN D12 IOSTANDARD LVCMOS33 } [get_ports { AUD_SD }];
 
 ## ---- LEDs ----------------------------------------------------------------------
 set_property -dict { PACKAGE_PIN H17 IOSTANDARD LVCMOS33 } [get_ports { LED[0] }];
@@ -68,10 +83,10 @@ set_clock_groups -asynchronous \
     -group [get_clocks -of_objects [get_pins u_mmcm/CLKOUT0]]
 
 ## Slow asynchronous inputs, all synchronised (2-FF) before use.
-set_false_path -from [get_ports { CPU_RESETN BTNC BTNU BTNL BTNR BTND SW[*] }]
+set_false_path -from [get_ports { CPU_RESETN BTNC BTNU BTNL BTNR BTND SW[*] ACL_MISO }]
 
 ## Outputs: VGA registered (monitor samples with its own PLL), LEDs static.
-set_false_path -to [get_ports { VGA_R[*] VGA_G[*] VGA_B[*] VGA_HS VGA_VS LED[*] }]
+set_false_path -to [get_ports { VGA_R[*] VGA_G[*] VGA_B[*] VGA_HS VGA_VS LED[*] ACL_SCLK ACL_MOSI ACL_CSN AUD_PWM AUD_SD }]
 
 ## ---- Configuration bank voltage (removes the CFGBVS DRC warning) -------------
 set_property CFGBVS VCCO        [current_design]

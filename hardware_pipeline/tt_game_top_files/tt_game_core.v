@@ -29,7 +29,13 @@
 //          other player.
 // Rules:   serve bounces on the server's half, then the receiver's half; a
 //          return bounces once on the opponent's half. Serve changes every
-//          2 points, every point from 10-10. Game to 11, win by 2.
+//          2 points. One game = first to 11 points.
+// Reach:   a press in the window only hits if the racket base is within
+//          TT_REACH of the ball's x; rackets follow the ball sideways at a
+//          limited speed (TT_TRACK_STEP) within +-TT_BASE_LIM, so wide balls
+//          can be winners.
+// Tilt:    tilt_en (P1 tilt mode): P1's shots land at x = tilt_x (board tilt),
+//          and P1's racket follows the ball fast (TT_TRACK_FAST).
 // auto[p]: computer player (switch): serves after TT_SERVE_AUTO frames,
 //          returns with small timing jitter, misses 1 ball in 8.
 //
@@ -44,6 +50,8 @@ module tt_game_core (
     input  wire [1:0]  btn_back,
     input  wire        btn_new,        // new game
     input  wire [1:0]  auto_play,      // computer plays player p
+    input  wire        tilt_en,        // P1 aims with the board tilt (accelerometer)
+    input  wire [15:0] tilt_x,         // P1 aim: bounce x, Q8.8, clamped to +-TT_TILT_MAX
     output reg         ev_clear,       // events consumed (1 clock)
     output wire [4:0]  ev_mask,        // which events were sampled {new, back[1:0], fore[1:0]}
 
@@ -63,7 +71,12 @@ module tt_game_core (
     output reg         server,
     output reg  [2:0]  state,
     output reg         winner,
-    output reg         step_busy       // 1 while a step is running (debug)
+    output reg         step_busy,      // 1 while a step is running (debug)
+
+    // sound events (1-clock pulses)
+    output reg         snd_hit,        // a racket hits the ball (serve or return)
+    output reg         snd_bounce,     // the ball bounces on the table
+    output reg         snd_point       // a point is scored
 );
 
 `include "tt_game_map.vh"
@@ -116,6 +129,8 @@ module tt_game_core (
     // sampled events
     reg  [1:0] ev_f, ev_b;
     reg        ev_n;
+    reg        t_en;                   // tilt inputs sampled at the start of the step
+    reg signed [15:0] t_x;
     assign ev_mask = {ev_n, ev_b, ev_f};
 
     // ------------------------------------------------------------------------
@@ -184,17 +199,31 @@ module tt_game_core (
 
     // score / serve rotation (U_ST, S_POINT)
     wire [7:0] n_pts  = {1'b0, score0} + {1'b0, score1};
-    wire       deuce  = (score0 >= TT_WIN_POINTS - 1) && (score1 >= TT_WIN_POINTS - 1);
-    wire       game_won = ((score0 >= TT_WIN_POINTS) || (score1 >= TT_WIN_POINTS)) &&
-                          ((score0 >= score1 + 7'd2) || (score1 >= score0 + 7'd2));
-    wire       next_server = first_server ^ (deuce ? n_pts[0] : n_pts[1]);
+    // one game = first to TT_WIN_POINTS (11); serve changes every 2 points
+    wire       game_won = (score0 >= TT_WIN_POINTS) || (score1 >= TT_WIN_POINTS);
+    wire       next_server = first_server ^ n_pts[1];
+
+    // tilt aiming (P1): bounce at the tilt x, hit x continues the sideways
+    // direction: hx = bx + (bx - px) * 5/16
+    wire signed [31:0] tbx  = {{8{t_x[15]}}, t_x, 8'd0};
+    wire signed [32:0] tdx  = tbx - px;
+    wire signed [35:0] tdx5 = (tdx <<< 2) + tdx;
+    wire signed [31:0] thx  = tbx + (tdx5 >>> 4);
+    wire       tilt_srv = t_en && (server == 1'b0);
+    wire       tilt_rcv = t_en && (recv   == 1'b0);
+
+    // reach: a press in the window only hits if the racket is near the ball
+    wire signed [16:0] reach_d  = (recv ? base_x1 : base_x0) - hx[23:8];
+    wire               reach_ok = (reach_d <= TT_REACH) && (reach_d >= -TT_REACH);
 
     // racket base x tracking target (U_TRACK)
     wire signed [15:0] hx_q8   = hx[23:8];
-    wire signed [15:0] trk_t0  = (state == S_FLIGHT && recv == 1'b0 && !miss) ? hx_q8 : 16'sd0;
-    wire signed [15:0] trk_t1  = (state == S_FLIGHT && recv == 1'b1 && !miss) ? hx_q8 : 16'sd0;
+    wire signed [15:0] hx_c    = (hx_q8 > TT_BASE_LIM) ? TT_BASE_LIM : (hx_q8 < -TT_BASE_LIM) ? -TT_BASE_LIM : hx_q8;
+    wire signed [15:0] trk_t0  = (state == S_FLIGHT && recv == 1'b0 && !miss) ? hx_c : 16'sd0;
+    wire signed [15:0] trk_t1  = (state == S_FLIGHT && recv == 1'b1 && !miss) ? hx_c : 16'sd0;
     wire signed [16:0] trk_d0  = trk_t0 - base_x0;
     wire signed [16:0] trk_d1  = trk_t1 - base_x1;
+    wire signed [15:0] trk_s0  = t_en ? TT_TRACK_FAST : TT_TRACK_STEP;   // P1 in tilt mode: fast
 
     // swing table lookups (U_PUB)
     wire [53:0] sw_e0 = tt_swing(sw_act[0] ? sw_type[0] : 1'b0, sw_act[0] ? sw_frame0 : 5'd0);
@@ -246,16 +275,20 @@ module tt_game_core (
             bob <= 32'sd0;  bob_cnt <= 5'd0;  bob_dir <= 1'b0;
             lk <= A_NONE;  lax <= 2'd0;  l_d <= 33'sd0;  l_rn <= 17'sd0;  l_prod <= 50'sd0;
             ev_f <= 2'b00;  ev_b <= 2'b00;  ev_n <= 1'b0;  ev_clear <= 1'b0;
+            t_en <= 1'b0;  t_x <= 16'sd0;
+            snd_hit <= 1'b0;  snd_bounce <= 1'b0;  snd_point <= 1'b0;
             rp_x <= 16'd0; rp_y <= 16'd0; rp_z <= 16'd0; rp_yaw <= 6'd0;
             ro_x <= 16'd0; ro_y <= 16'd0; ro_z <= 16'd0; ro_yaw <= 6'd0;
             bl_x <= 16'd0; bl_y <= 16'd0; bl_z <= 16'd0; bl_yaw <= 6'd0; bl_vis <= 1'b0;
             req_toggle <= 1'b0;  step_busy <= 1'b0;
         end else begin
             ev_clear <= 1'b0;
+            snd_hit <= 1'b0;  snd_bounce <= 1'b0;  snd_point <= 1'b0;
             case (u)
             // ---------------------------------------------------------------
             U_IDLE: if (frame_tick) begin
                 ev_f <= btn_fore;  ev_b <= btn_back;  ev_n <= btn_new;
+                t_en <= tilt_en;   t_x <= tilt_x;
                 ev_clear  <= 1'b1;
                 step_busy <= 1'b1;
                 u <= U_IN;
@@ -308,7 +341,8 @@ module tt_game_core (
 
                 S_SERVING: begin
                     if (con_srv) begin
-                        bx <= pl_bx;  hx <= pl_hx;  ai_t <= pl_ai_t;
+                        bx <= tilt_srv ? tbx : pl_bx;  hx <= tilt_srv ? thx : pl_hx;  ai_t <= pl_ai_t;
+                        snd_hit <= 1'b1;
                         hitter <= server;  recv <= ~server;
                         tta <= TTA_SERVE;
                         swung <= 1'b0;  recv_ok <= 1'b0;  miss <= 1'b0;
@@ -333,7 +367,7 @@ module tt_game_core (
                                 sw_type[0] <= ai_press ? !ai_fore : pr_recv[0];
                             end
                             swung <= 1'b1;
-                            if (tta >= TT_W_LO && tta <= TT_W_HI) recv_ok <= 1'b1;
+                            if (tta >= TT_W_LO && tta <= TT_W_HI && reach_ok) recv_ok <= 1'b1;
                             else                                  miss    <= 1'b1;
                         end else if (tta < TT_W_LO)
                             miss <= 1'b1;
@@ -378,12 +412,13 @@ module tt_game_core (
             // b) contact by the receiver -> return the ball
             U_FB: begin
                 if (con_recv && recv_ok) begin
-                    bx <= pl_bx;  hx <= pl_hx;  ai_t <= pl_ai_t;
+                    bx <= tilt_rcv ? tbx : pl_bx;  hx <= tilt_rcv ? thx : pl_hx;  ai_t <= pl_ai_t;
+                    snd_hit <= 1'b1;
                     hitter <= recv;  recv <= ~recv;
                     tta <= TTA_RALLY;
                     swung <= 1'b0;  recv_ok <= 1'b0;  miss <= 1'b0;
                     lk <= A_RALLY;
-                    tx <= pl_bx;  ty <= TT_Y_BOUNCE;  tz <= side_z(~recv, TT_Z_RB);
+                    tx <= tilt_rcv ? tbx : pl_bx;  ty <= TT_Y_BOUNCE;  tz <= side_z(~recv, TT_Z_RB);
                     lax <= 2'd0;
                     u <= U_LD;  u_ret <= U_D;
                 end else
@@ -401,12 +436,14 @@ module tt_game_core (
                     arc_left <= 6'd0;
                     case (arc)
                     A_SERVE1: begin
+                        snd_bounce <= 1'b1;
                         px <= tx;  py <= ty;  pz <= tz;
                         lk <= A_SERVE2;
                         tx <= bx;  ty <= TT_Y_BOUNCE;  tz <= side_z(recv, TT_Z_SB2);
                         lax <= 2'd0;  u <= U_LD;  u_ret <= U_D;
                     end
                     A_SERVE2, A_RALLY: begin
+                        snd_bounce <= 1'b1;
                         px <= tx;  py <= ty;  pz <= tz;
                         lk <= A_TOHIT;
                         tx <= hx;  ty <= TT_Y_HIT;  tz <= side_z(recv, TT_Z_HIT);
@@ -460,6 +497,7 @@ module tt_game_core (
             U_D: begin
                 if (miss && tta <= -TT_MISS_FRAMES) begin
                     vis <= 1'b0;
+                    snd_point <= 1'b1;
                     if (hitter) score1 <= score1 + 7'd1;
                     else        score0 <= score0 + 7'd1;
                     state <= S_POINT;
@@ -479,9 +517,9 @@ module tt_game_core (
             // idle rackets follow the incoming ball sideways
             U_TRACK: begin
                 if (!sw_act[0]) begin
-                    if (trk_d0 <= TT_TRACK_STEP && trk_d0 >= -TT_TRACK_STEP) base_x0 <= trk_t0;
-                    else if (trk_d0 > 0) base_x0 <= base_x0 + TT_TRACK_STEP;
-                    else                 base_x0 <= base_x0 - TT_TRACK_STEP;
+                    if (trk_d0 <= trk_s0 && trk_d0 >= -trk_s0) base_x0 <= trk_t0;
+                    else if (trk_d0 > 0) base_x0 <= base_x0 + trk_s0;
+                    else                 base_x0 <= base_x0 - trk_s0;
                 end
                 if (!sw_act[1]) begin
                     if (trk_d1 <= TT_TRACK_STEP && trk_d1 >= -TT_TRACK_STEP) base_x1 <= trk_t1;

@@ -5,7 +5,8 @@
 //   * P1 serves with BTNR at frame 2, then the frames run on their own
 //   * per frame: captured poses, object vertices in vertex memory, render
 //     time and overrun flag -> frames.txt (check: tt_game_model.py --check-sim frames.txt)
-//   * the VGA output (with the score panel) of chosen frames -> screen_a.ppm (frame 4), screen_b.ppm (last frame)
+//   * BTNC short press at frame 5 -> side view (view 1)
+//   * the VGA output (with the score panel) of chosen frames -> screen_a.ppm (frame 4, view 0), screen_b.ppm (last frame, view 1)
 // Debounce shortened (DB_BITS = 4) so the press is seen at once.
 // ============================================================================
 module tb_tt_game;
@@ -14,7 +15,7 @@ module tb_tt_game;
     always #19.861 clk_v = ~clk_v;
 
     reg  [4:0] btn = 5'd0;          // {C, U, L, R, D}
-    reg  [1:0] sw  = 2'b00;
+    reg  [5:0] sw  = 6'b000000;
     wire [15:0] led;
     wire [3:0] r, g, b;
     wire hs, vs;
@@ -22,8 +23,11 @@ module tb_tt_game;
     tt_game #(.DB_BITS (4)) dut (
         .clk_render (clk_r), .clk_vga (clk_v), .arst_n (arst_n),
         .btn (btn), .sw (sw), .led (led),
+        .acl_sclk (), .acl_mosi (), .acl_miso (1'b0), .acl_csn (),
+        .aud_pwm_o (), .aud_sd (),
         .vga_r (r), .vga_g (g), .vga_b (b), .vga_hs (hs), .vga_vs (vs));
 
+`include "tt_scene_map.vh"
     integer NFR;
     integer fr = 0, fd, i, x, y;
     reg [11:0] scr [0:640*480-1];
@@ -52,7 +56,7 @@ module tb_tt_game;
         $fwrite(fd, "P %h %h %h %h %h %h %h %h %h %h %h %h %h\n",
                 dut.c_rp_x, dut.c_rp_y, dut.c_rp_z, dut.c_rp_yaw, dut.c_ro_x, dut.c_ro_y, dut.c_ro_z, dut.c_ro_yaw,
                 dut.c_bl_x, dut.c_bl_y, dut.c_bl_z, dut.c_bl_yaw, dut.c_bl_vis);
-        for (i = 843; i < 999; i = i + 1)
+        for (i = TT_N_STATIC; i < TT_NUM_VERTICES; i = i + 1)
             $fwrite(fd, "V %h\n", dut.u_pipeline.u_vertex_memory.ram[i]);
     end
 
@@ -72,6 +76,8 @@ module tb_tt_game;
         wait (fr == 2);
         #1000 btn[1] = 1'b1;               // BTNR: P1 forehand serve
         #3000 btn[1] = 1'b0;
+        wait (fr == 5);  #1000 btn[4] = 1'b1;   // BTNC short press -> side view
+        wait (fr == 6);  #1000 btn[4] = 1'b0;
         while (fr < NFR) begin
             @(posedge clk_v);
             if (dut.tick_440 && (fr == 4 || fr == NFR - 1)) dump_screen(fr);

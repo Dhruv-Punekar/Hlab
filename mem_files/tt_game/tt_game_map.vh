@@ -25,7 +25,11 @@ localparam signed [31:0] TT_Z_SB2     = 32'sd491520;
 localparam signed [31:0] TT_Z_RB      = 32'sd524288;
 localparam signed [31:0] TT_HOLD_Y    = 32'sd675021;
 localparam signed [31:0] TT_BOB_STEP  = 32'sd1365;
-localparam signed [15:0] TT_TRACK_STEP = 16'sd31;   // Q8.8
+localparam signed [15:0] TT_TRACK_STEP = 16'sd26;   // Q8.8
+localparam signed [15:0] TT_TRACK_FAST = 16'sd102;   // Q8.8, P1 in tilt mode
+localparam signed [15:0] TT_BASE_LIM   = 16'sd1152;   // Q8.8, racket base x limit
+localparam signed [15:0] TT_REACH      = 16'sd410;   // Q8.8, hit only if |base - ball x| <= this
+localparam signed [15:0] TT_TILT_MAX   = 16'sd1152;   // Q8.8, tilt aiming range
 
 // arcs: kind 1 SERVE1, 2 SERVE2, 3 RALLY, 4 TOHIT -> frames N, gravity g, 65536/N, g*(N-1)/2
 localparam TT_N_SERVE1 = 14;  localparam signed [31:0] TT_G_SERVE1 = 32'sd802;  localparam [15:0] TT_RN_SERVE1 = 16'd4681;  localparam signed [31:0] TT_GH_SERVE1 = 32'sd5213;

@@ -4,7 +4,9 @@ TABLE-TENNIS DEMO SCENE - TECHNICAL NOTES  (step 1: static scene)
 
 Files
   mem_files/tt_game/gen_tt_scene.py     scene generator (Python)
-  mem_files/tt_game/vertices.mem        999 vertices (333 triangles), 1024 lines
+  mem_files/tt_game/vertices.mem        step 3: 1329 vertices (view 0 scene + moving
+                                        objects), 2048 lines; step 1 had 999 / 1024
+  mem_files/tt_game/tt_views.mem        step 3: static scene of each camera view
   mem_files/tt_game/matrix.mem          camera matrix (projection x view)
   mem_files/tt_game/tt_scene_map.vh     counts, colours, horizon row, moving objects
   mem_files/tt_game/scene_info.txt      generator report
@@ -78,4 +80,17 @@ so the z_f_buffer truncation keeps them exactly.
   Copy vertices.mem, matrix.mem and tt_scene_map.vh into the Vivado
   project (with recip_lut_q1_17.mem). Check scene_info.txt: vertices
   <= 1024 and frame total < 3.97 ms.
+
+
+5. STEP 3: SEVERAL CAMERA VIEWS
+- gen_tt_scene.py builds the static scene once per view (VIEWS: player 1,
+  side, player 2), each with its own floor grid extent and its own
+  clipping / back-face pruning, padded to the same length (TT_N_STATIC =
+  1173 vertices, unused triangles have three equal vertices). The views
+  share pitch and FOV, so TT_HORIZON_ROW (114) holds for all of them.
+- Outputs: tt_views.mem (all views), tt_view_mat() in tt_scene_map.vh (all
+  matrices), vertices.mem / matrix.mem = view 0 (power-up image),
+  preview.png / preview_view1.png / preview_view2.png.
+- Static triangles per view 281 / 391 / 271; worst frame 3.10 / 2.41 /
+  2.61 ms with the moving objects.
 ========================================================================
