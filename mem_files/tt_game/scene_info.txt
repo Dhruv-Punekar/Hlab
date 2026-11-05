@@ -1,11 +1,11 @@
 Table-tennis scene
-triangles: 333 (307 drawn, 26 back-facing)  vertices: 999  VERTEX_DEPTH: 1024
-  static: 281 (+24 back-facing, not stored)  RACKET_P: 20  RACKET_O: 20  BALL: 12
-rasterizer cost: 190194 cycles = 1902 us (+ clear 1200 us)
-frame total ~3.10 ms  (VGA blanking window for tear-free redraw: 3.97 ms)
+view 0 (player 1 (near end)): static triangles 281, horizon row 114, raster cost 190194 cyc -> frame ~3.10 ms (gap 3.97 ms); camera (0.0, 2.05, 3.55) m
+view 1 (side): static triangles 391, horizon row 114, raster cost 121086 cyc -> frame ~2.41 ms (gap 3.97 ms); camera (6.8, 3.07, 0.45) m
+view 2 (player 2 (far end)): static triangles 271, horizon row 114, raster cost 141224 cyc -> frame ~2.61 ms (gap 3.97 ms); camera (-0.0, 2.45, -4.6) m
+vertices: 1329 (1173 static per view + 156 moving)  VERTEX_DEPTH: 2048
+tt_views.mem: 3519 x 64 bit
 horizon row: 114  sky (8, 12, 15)  floor (4, 4, 5) (RGB444)
-camera: pos (0.0, 2.05, 3.55) m, look-at (0.0, 0.45, -0.6) m, fov 52.0 deg, near 1.0 m, far 16.0 m
 moving objects (vertex base, count):
-  RACKET_P  base   843  count  60  centre (m) (0.3, 0.95, 1.55)
-  RACKET_O  base   903  count  60  centre (m) (-0.25, 1.0, -1.6)
-  BALL      base   963  count  36  centre (m) (0.1, 1.05, -0.55)
+  RACKET_P  base  1173  count  60  centre (m) (0.3, 0.95, 1.55)
+  RACKET_O  base  1233  count  60  centre (m) (-0.25, 1.0, -1.6)
+  BALL      base  1293  count  36  centre (m) (0.1, 1.05, -0.55)
